@@ -1,0 +1,21 @@
+# PyInstaller
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs & data
+detections.csv
+debug_log.csv
+freq_memory.json
+
+# Geluid (gegenereerd)
+_beep.wav
+
+# OS
+.DS_Store
+Thumbs.db
