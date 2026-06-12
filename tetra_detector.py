@@ -102,6 +102,8 @@ BASELINE_FREEZE  = 20.0   # vaste freeze-grens, los van drempel
 SLOT_FLOOR       = 20.0   # minimum dB om in balk te tonen, los van drempel
 
 _SEARCH_PATHS = [
+    "/usr/local/bin/rtl_tcp",
+    "/opt/homebrew/bin/rtl_tcp",
     r"C:\Users\dayas\Desktop\sdrsharp-x64\rtl_tcp.exe",
     r"C:\Program Files\rtl-sdr\rtl_tcp.exe",
     "rtl_tcp", "rtl_tcp.exe",
@@ -139,6 +141,9 @@ class TcpDetector:
         self.auto_gain     = False
         self.freqs         = self._calc_freqs(DEFAULT_CENTER)
         self.power         = np.full(FFT_SIZE, -80.0)
+        # Hann-window tegen spectrale lekkage → schoner spectrum, minder valse detecties
+        self._window       = np.hanning(FFT_SIZE).astype(np.float32)
+        self._win_norm     = float(np.sum(self._window))
         self.baseline      = None
         self.wfall         = np.full((WFALL_ROWS, FFT_SIZE), -80.0)
         self.threshold        = float(THRESHOLD_SOFT)
@@ -185,6 +190,12 @@ class TcpDetector:
         # Frequentie geheugen
         self._freq_history    = deque()   # (timestamp, freq, db)
         self.known_freqs      = self._load_known_freqs()
+        # Adaptief storingsfilter — onderdrukt kanalen die te lang onafgebroken
+        # hoog staan (= storing), past zich aan tijdens het rijden
+        self.adaptive_filter      = False
+        self._hot_since           = {}    # freq → tijdstip dat kanaal continu hoog werd
+        self._suppressed          = set() # freqs die nu als storing onderdrukt worden
+        self.interference_secs    = 25.0  # na X sec onafgebroken hoog → storing
 
     def _calc_freqs(self, center_hz):
         return np.linspace((center_hz - SAMPLE_RATE/2) / 1e6,
@@ -416,8 +427,10 @@ class TcpDetector:
                     raw     = buf[:needed]; del buf[:needed]
                     iq      = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 127.5) / 127.5
                     samples = iq[0::2] + 1j * iq[1::2]
-                    fft     = np.fft.fftshift(np.abs(np.fft.fft(samples, FFT_SIZE)))
-                    power   = 20 * np.log10(fft / FFT_SIZE + 1e-10)
+                    # Hann-window toepassen tegen spectrale lekkage
+                    windowed = samples * self._window
+                    fft     = np.fft.fftshift(np.abs(np.fft.fft(windowed, FFT_SIZE)))
+                    power   = 20 * np.log10(fft / self._win_norm + 1e-10)
                     self.n_frames += 1
                     with self._lock:
                         self.wfall    = np.roll(self.wfall, 1, axis=0)
@@ -443,7 +456,10 @@ class TcpDetector:
                             for cf in TETRA_FREQS:
                                 if self.freqs[0] <= cf <= self.freqs[-1]:
                                     idx = int(np.argmin(np.abs(self.freqs - cf)))
-                                    raw_db = float(diff[idx])
+                                    # Gemiddelde over ±3 bins (~25 kHz TETRA-kanaal) → robuust tegen kleine
+                                    # freq-offset, zonder max-bias die valse alarmen op ruis veroorzaakt
+                                    lo = max(0, idx - 3); hi = min(FFT_SIZE, idx + 4)
+                                    raw_db = float(np.mean(diff[lo:hi]))
                                     raw_ch[cf] = raw_db
                                     if cf not in self._ch_history:
                                         self._ch_history[cf] = deque(maxlen=N_SMOOTH)
@@ -463,8 +479,9 @@ class TcpDetector:
                                     self._alarm_cleared_at = now
                                 silent_secs = now - self._alarm_cleared_at
                                 if best_db < BASELINE_FREEZE or silent_secs > 10.0:
-                                    # Na 10s rust: sneller bijwerken om bevroren baseline te corrigeren
-                                    alpha = 0.003 if silent_secs <= 10.0 else min(0.05, 0.003 + (silent_secs - 10.0) * 0.002)
+                                    # Na 10s rust: iets sneller bijwerken om bevroren baseline te corrigeren,
+                                    # maar mild gehouden (max 0.008) zodat de baseline stabiel/recht blijft
+                                    alpha = 0.003 if silent_secs <= 10.0 else min(0.008, 0.003 + (silent_secs - 10.0) * 0.0003)
                                     self.baseline = (1 - alpha) * self.baseline + alpha * power
                             else:
                                 self._alarm_cleared_at = 0.0
@@ -501,9 +518,28 @@ class TcpDetector:
                                         slot["freq"] = None
                                 elif slot["freq"] is not None:
                                     slot["decay_t"] = 0.0
+                            # Adaptief storingsfilter: kanaal dat te lang onafgebroken
+                            # hoog staat = storing → onderdrukken. Reset zodra het wegvalt.
+                            for cf, db in raw_ch.items():
+                                if db > self.threshold:
+                                    if cf not in self._hot_since:
+                                        self._hot_since[cf] = now
+                                    elif now - self._hot_since[cf] > self.interference_secs:
+                                        self._suppressed.add(cf)
+                                elif db < self.slot_floor:
+                                    # kanaal weer stil → vrijgeven
+                                    self._hot_since.pop(cf, None)
+                                    self._suppressed.discard(cf)
+
                             # Alarm & beep op basis van RUWE waarden (geen smoothing)
-                            best_raw_db   = max(raw_ch.values(), default=0.0)
-                            best_raw_freq = max(raw_ch, key=raw_ch.get) if raw_ch else 0.0
+                            # Bij actief filter: onderdrukte (storings)kanalen overslaan
+                            if self.adaptive_filter and self._suppressed:
+                                alarm_ch = {cf: db for cf, db in raw_ch.items()
+                                            if cf not in self._suppressed}
+                            else:
+                                alarm_ch = raw_ch
+                            best_raw_db   = max(alarm_ch.values(), default=0.0)
+                            best_raw_freq = max(alarm_ch, key=alarm_ch.get) if alarm_ch else 0.0
 
                             # Frequentie geschiedenis bijhouden (2 min venster)
                             if best_raw_db > self.slot_floor:
@@ -1427,7 +1463,8 @@ class WaterfallPanelWidget(QWidget):
         self.img = pg.ImageItem()
         self.pw.addItem(self.img)
         self.img.setColorMap(pg.colormap.get('inferno'))
-        self.img.setImage(data.T)
+        self.img.setLevels((-80, -20))
+        self.img.setImage(data.T, autoLevels=False)
         self._apply_transform(freqs, data.shape)
 
     def _apply_transform(self, freqs, shape):
@@ -1438,7 +1475,7 @@ class WaterfallPanelWidget(QWidget):
         self.pw.setXRange(freqs[0], freqs[-1])
 
     def refresh(self, data, freqs):
-        self.img.setImage(data.T)
+        self.img.setImage(data.T, autoLevels=False)
         self._apply_transform(freqs, data.shape)
 
 
@@ -1719,6 +1756,7 @@ class MainWindow(QMainWindow):
         det.hard_threshold = _load("hard_threshold", det.hard_threshold, lo=10,  hi=60)
         det.auto_gain      = self._settings.value("auto_gain", "false") == "true"
         det.muted          = self._settings.value("muted",     "false") == "true"
+        det.adaptive_filter = self._settings.value("adaptive_filter", "false") == "true"
         saved_mode         = _load("mode_idx", 1, cast=int, lo=0, hi=len(MODES)-1)
         # Custom modus waarden laden
         MODES[1]["slot_floor"]     = _load("custom_floor", MODES[1]["slot_floor"],     lo=0,   hi=40)
@@ -2002,6 +2040,15 @@ class MainWindow(QMainWindow):
         btn_reset = QPushButton("Reset Baseline  [R]")
         btn_reset.clicked.connect(det.reset_baseline)
         ts_box.addWidget(btn_reset)
+
+        self.btn_adaptive = QPushButton("🛡  Storingsfilter  UIT")
+        self.btn_adaptive.setMinimumHeight(34)
+        self.btn_adaptive.clicked.connect(self._on_adaptive)
+        ts_box.addWidget(self.btn_adaptive)
+        if det.adaptive_filter:
+            self.btn_adaptive.setText("🛡  Storingsfilter  AAN")
+            self.btn_adaptive.setStyleSheet(f"color: {C['green']}; border-color: {C['green']};")
+
         ts_box.addWidget(self._divider())
         btn_wfall = QPushButton("Waterfall venster")
         btn_wfall.clicked.connect(self._open_waterfall)
@@ -2221,6 +2268,19 @@ class MainWindow(QMainWindow):
         else:
             self.btn_auto.setText("Auto Gain  UIT")
             self.btn_auto.setStyleSheet("")
+
+    def _on_adaptive(self):
+        self.det.adaptive_filter = not self.det.adaptive_filter
+        if self.det.adaptive_filter:
+            self.btn_adaptive.setText("🛡  Storingsfilter  AAN")
+            self.btn_adaptive.setStyleSheet(
+                f"color: {C['green']}; border-color: {C['green']};")
+        else:
+            self.btn_adaptive.setText("🛡  Storingsfilter  UIT")
+            self.btn_adaptive.setStyleSheet("")
+            # alles vrijgeven bij uitschakelen
+            self.det._suppressed.clear()
+            self.det._hot_since.clear()
 
     def _on_test(self):
         if self._test_running:
@@ -2489,6 +2549,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("mode_idx",       self._mode_idx)
         self._settings.setValue("hard_threshold", self.det.hard_threshold)
         self._settings.setValue("muted",          str(self.det.muted).lower())
+        self._settings.setValue("adaptive_filter", str(self.det.adaptive_filter).lower())
         self._settings.setValue("custom_floor",   MODES[1]["slot_floor"])
         self._settings.setValue("custom_thr",     MODES[1]["threshold"])
         self._settings.setValue("custom_hard",    MODES[1]["hard_threshold"])
