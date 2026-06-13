@@ -8,12 +8,6 @@ from collections import deque
 import numpy as np
 import socket, struct, subprocess, threading, time, sys, os, wave, math, platform
 from datetime import datetime
-import matplotlib
-matplotlib.use("QtAgg")
-import matplotlib.pyplot as plt
-import matplotlib.animation as _mpl_anim
-import matplotlib.gridspec as _mpl_gs
-from matplotlib.widgets import Slider as _MplSlider, Button as _MplButton
 
 # ── Geluid ────────────────────────────────────────────────────────────────────
 def _sound_dir():
@@ -71,8 +65,6 @@ except ImportError:
             os.system(f"afplay '{_SIREN_WAV}'")
         else:
             os.system(f"aplay '{_SIREN_WAV}' 2>/dev/null || paplay '{_SIREN_WAV}' 2>/dev/null")
-            if os.path.exists(_WASTED_WAV):
-                os.system(f"aplay '{_WASTED_WAV}' 2>/dev/null || paplay '{_WASTED_WAV}' 2>/dev/null")
 
 # ── Instellingen ──────────────────────────────────────────────────────────────
 DEFAULT_CENTER   = 382_500_000
@@ -117,15 +109,13 @@ else:
 
 LOG_PATH         = os.path.join(_LOG_DIR, "detections.csv")
 DEBUG_LOG_PATH   = os.path.join(_LOG_DIR, "debug_log.csv")
-FREQ_MEMORY_PATH = os.path.join(_LOG_DIR, "freq_memory.json")
 
-TETRA_FREQS = [
-    380.150, 380.400, 380.650, 380.900,
-    381.150, 381.400, 381.650, 381.900,
-    382.150, 382.400, 382.650, 382.900,
-    383.150, 383.400, 383.650, 383.900,
-    384.150, 384.400, 384.650, 384.900,
-]
+# Volledig TETRA 25 kHz raster over de uplink band (380–385 MHz).
+# Hierdoor wordt elk mogelijk kanaal gedekt, niet alleen elke 250 kHz.
+TETRA_FREQS = [round(380.0 + i * 0.025, 3) for i in range(int((385.0 - 380.0) / 0.025) + 1)]
+
+# Lichte rasterlijnen voor de spectrumweergave (elke 0.25 MHz, anders te druk).
+DISPLAY_GRID = [round(380.0 + i * 0.25, 2) for i in range(int((385.0 - 380.0) / 0.25) + 1)]
 
 def send_cmd(sock, cmd, param):
     sock.sendall(struct.pack(">BI", cmd, param))
@@ -183,13 +173,16 @@ class TcpDetector:
         self.agr_active       = False
         self._agr_orig_gain   = None
         self._agr_clear_time  = 0.0
+        # Bezettingscheck — onderdrukt smalle birdies/storing
+        self.occupancy_check  = True
+        # Patroonherkenning — bursts per kanaal tellen (activiteitsniveau)
+        self._ch_above        = set()   # kanalen die nu boven de vloer zitten
+        self._burst_times     = {}      # cf → deque met burst-tijdstempels
+        self.alarm_activity   = 0       # aantal bursts laatste 10s op alarm-kanaal
         # Verbindingsmodus
         self.connection_mode  = "PC"   # "PC" of "Android"
         self._tcp_port        = TCP_PORT
         self.android_host     = "192.168.0.144"  # IP van de telefoon
-        # Frequentie geheugen
-        self._freq_history    = deque()   # (timestamp, freq, db)
-        self.known_freqs      = self._load_known_freqs()
         # Adaptief storingsfilter — onderdrukt kanalen die te lang onafgebroken
         # hoog staan (= storing), past zich aan tijdens het rijden
         self.adaptive_filter      = False
@@ -198,8 +191,14 @@ class TcpDetector:
         self.interference_secs    = 25.0  # na X sec onafgebroken hoog → storing
 
     def _calc_freqs(self, center_hz):
-        return np.linspace((center_hz - SAMPLE_RATE/2) / 1e6,
-                           (center_hz + SAMPLE_RATE/2) / 1e6, FFT_SIZE)
+        f = np.linspace((center_hz - SAMPLE_RATE/2) / 1e6,
+                        (center_hz + SAMPLE_RATE/2) / 1e6, FFT_SIZE)
+        # MHz per bin — voor snelle index-berekening i.p.v. argmin
+        self._bin_mhz = (f[-1] - f[0]) / (FFT_SIZE - 1)
+        # Aantal bins in een 25 kHz TETRA-kanaal (afhankelijk van FFT/sample rate)
+        self._ch_bins     = max(2, int(round(0.025 / self._bin_mhz)))
+        self._ch_halfbins = max(1, self._ch_bins // 2)
+        return f
 
     def _drain(self, pipe):
         try:
@@ -327,32 +326,6 @@ class TcpDetector:
             for s in self.slots:
                 s["freq"] = None; s["db"] = 0.0
 
-    def _load_known_freqs(self):
-        try:
-            if os.path.exists(FREQ_MEMORY_PATH):
-                import json
-                with open(FREQ_MEMORY_PATH, "r", encoding="utf-8") as f:
-                    return set(json.load(f))
-        except Exception: pass
-        return set()
-
-    def save_known_freq(self, freq):
-        """Sla frequentie op als bevestigd hulpdienst kanaal."""
-        self.known_freqs.add(round(freq, 3))
-        try:
-            import json
-            with open(FREQ_MEMORY_PATH, "w", encoding="utf-8") as f:
-                json.dump(sorted(self.known_freqs), f)
-        except Exception: pass
-
-    def get_best_freq_last_2min(self):
-        """Geeft de sterkste frequentie van de laatste 2 minuten terug."""
-        cutoff = time.time() - 120.0
-        recent = [(db, freq) for (ts, freq, db) in self._freq_history if ts >= cutoff]
-        if not recent:
-            return None
-        return max(recent)[1]
-
     def _ensure_csv(self):
         try:
             if not os.path.exists(LOG_PATH) or os.path.getsize(LOG_PATH) == 0:
@@ -372,24 +345,6 @@ class TcpDetector:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(f"{ts},DETECTIE,{freq:.3f},{db:.1f},{self.mode_name},slot{slot_num+1}\n")
-        except Exception:
-            pass
-
-    def _log_police(self):
-        try:
-            self._ensure_csv()
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with self._lock:
-                actief = [(i, s["freq"], s["db"])
-                          for i, s in enumerate(self.slots)
-                          if s["freq"] is not None and s["db"] > 0]
-                mode = self.mode_name
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
-                if actief:
-                    for i, freq, db in actief:
-                        f.write(f"{ts},POLITIE,{freq:.3f},{db:.1f},{mode},slot{i+1}\n")
-                else:
-                    f.write(f"{ts},POLITIE,geen_signaal,0,{mode},-\n")
         except Exception:
             pass
 
@@ -455,11 +410,28 @@ class TcpDetector:
                             raw_ch   = {}  # ongefilterd → alarm & beep
                             for cf in TETRA_FREQS:
                                 if self.freqs[0] <= cf <= self.freqs[-1]:
-                                    idx = int(np.argmin(np.abs(self.freqs - cf)))
-                                    # Gemiddelde over ±3 bins (~25 kHz TETRA-kanaal) → robuust tegen kleine
-                                    # freq-offset, zonder max-bias die valse alarmen op ruis veroorzaakt
-                                    lo = max(0, idx - 3); hi = min(FFT_SIZE, idx + 4)
+                                    # Index direct berekenen (freqs is lineair) i.p.v. argmin → veel sneller
+                                    idx = int(round((cf - self.freqs[0]) / self._bin_mhz))
+                                    idx = max(0, min(FFT_SIZE - 1, idx))
+                                    # Gemiddelde over een half kanaal (~12 kHz) rond het centrum → robuust
+                                    # tegen kleine freq-offset, zonder max-bias die valse alarmen geeft
+                                    hw = self._ch_halfbins
+                                    lo = max(0, idx - hw); hi = min(FFT_SIZE, idx + hw + 1)
                                     raw_db = float(np.mean(diff[lo:hi]))
+
+                                    # Bezettingscheck: echt TETRA vult het volle 25 kHz kanaal,
+                                    # een birdie/storing zit in 1-2 bins. Tel hoeveel bins "vol" zijn.
+                                    if self.occupancy_check and raw_db > self.slot_floor:
+                                        wlo = max(0, idx - self._ch_bins); whi = min(FFT_SIZE, idx + self._ch_bins)
+                                        seg = diff[wlo:whi]
+                                        peak = float(np.max(seg))
+                                        # bins binnen 6 dB van de piek = "bezet"
+                                        filled = int(np.count_nonzero(seg > peak - 6.0))
+                                        occupancy = filled / max(1, seg.size)
+                                        if occupancy < 0.30:
+                                            # Te smal → birdie/storing → onderdruk
+                                            raw_db = min(raw_db, self.slot_floor - 2.0)
+
                                     raw_ch[cf] = raw_db
                                     if cf not in self._ch_history:
                                         self._ch_history[cf] = deque(maxlen=N_SMOOTH)
@@ -472,6 +444,20 @@ class TcpDetector:
                                     self.raw_peaks[cf] = (rdb, now + 3.0)
                                 else:
                                     self.raw_peaks[cf] = (pk_db, pk_exp)
+
+                            # Patroonherkenning — detecteer bursts (stijgende flank boven de vloer)
+                            for cf, rdb in raw_ch.items():
+                                if rdb > self.slot_floor:
+                                    if cf not in self._ch_above:
+                                        # Nieuwe burst op dit kanaal
+                                        self._ch_above.add(cf)
+                                        self._burst_times.setdefault(cf, deque()).append(now)
+                                else:
+                                    self._ch_above.discard(cf)
+                            # Oude bursts (>10s) opruimen
+                            for cf, dq in self._burst_times.items():
+                                while dq and now - dq[0] > 10.0:
+                                    dq.popleft()
                             # Baseline freeze op basis van smoothed waarden
                             best_db = max(ch_db.values(), default=0.0)
                             if self.alarm_level == 0:
@@ -541,12 +527,6 @@ class TcpDetector:
                             best_raw_db   = max(alarm_ch.values(), default=0.0)
                             best_raw_freq = max(alarm_ch, key=alarm_ch.get) if alarm_ch else 0.0
 
-                            # Frequentie geschiedenis bijhouden (2 min venster)
-                            if best_raw_db > self.slot_floor:
-                                self._freq_history.append((now, best_raw_freq, best_raw_db))
-                                while self._freq_history and now - self._freq_history[0][0] > 120.0:
-                                    self._freq_history.popleft()
-
                             if best_raw_db > hard_thr:
                                 self.alarm = True; self.alarm_level = 2
                                 self.alarm_freq = best_raw_freq; self.alarm_db = best_raw_db
@@ -565,6 +545,12 @@ class TcpDetector:
                             elif now >= self._alarm_until:
                                 self.alarm = False; self.alarm_level = 0
                                 self._last_red_beep = 0.0
+
+                            # Activiteitsniveau op het alarm-kanaal (aantal bursts laatste 10s)
+                            if self.alarm and self.alarm_freq in self._burst_times:
+                                self.alarm_activity = len(self._burst_times[self.alarm_freq])
+                            else:
+                                self.alarm_activity = 0
 
                             # Sirene met harde 60s cooldown
                             if self.alarm_level == 2 and not self.muted:
@@ -627,229 +613,13 @@ class TcpDetector:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Klassieke matplotlib weergave
-# ══════════════════════════════════════════════════════════════════════════════
-_CLASSIC_ANIS = []   # voorkomt garbage collection van animatie
-
-def open_classic_view(det):
-    global _CLASSIC_ANIS
-    for a in list(_CLASSIC_ANIS):
-        try: plt.close(a._fig)
-        except Exception: pass
-    _CLASSIC_ANIS.clear()
-
-    BG = "#0d1117"; PANEL = "#161b22"; CYAN = "#58d9f0"
-    RED = "#ff4444"; GREEN = "#44dd88"; ORANGE = "#f0a500"
-    WHITE = "#e6edf3"; GRAY = "#444c56"; ALARM_BG = "#3d0000"
-
-    fig = plt.figure(figsize=(16, 10), facecolor=BG)
-    fig.canvas.manager.set_window_title("PrioSense — Klassiek")
-
-    # Linker kolom: spectrum + meters via GridSpec
-    gs = _mpl_gs.GridSpec(1, 1, figure=fig,
-                          left=0.05, right=0.68, top=0.97, bottom=0.06)
-    gs_l = _mpl_gs.GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[0],
-                                           height_ratios=[2.5, 2.0], hspace=0.42)
-    ax_spec  = fig.add_subplot(gs_l[0])
-    ax_meter = fig.add_subplot(gs_l[1])
-
-    for ax in [ax_spec, ax_meter]:
-        ax.set_facecolor(PANEL)
-        ax.tick_params(colors=WHITE, labelsize=8)
-        for sp in ax.spines.values(): sp.set_color(GRAY)
-
-    # Rechter kolom: widgets via add_axes (vaste posities → klikbaar)
-    RX = 0.725   # links van rechterkolom
-    RW = 0.255   # breedte rechterkolom
-    ax_alrm  = fig.add_axes([RX, 0.800, RW, 0.165])
-    ax_thr   = fig.add_axes([RX, 0.696, RW, 0.068])
-    ax_gain  = fig.add_axes([RX, 0.590, RW, 0.068])
-    ax_freq  = fig.add_axes([RX, 0.484, RW, 0.068])
-    ax_auto  = fig.add_axes([RX, 0.378, RW, 0.062])
-    ax_reset = fig.add_axes([RX, 0.272, RW, 0.062])
-    ax_info  = fig.add_axes([RX, 0.155, RW, 0.062])
-    ax_time  = fig.add_axes([RX, 0.068, RW, 0.062])
-
-    for ax in [ax_alrm, ax_info, ax_time]:
-        ax.set_facecolor(BG)
-        for sp in ax.spines.values(): sp.set_visible(False)
-        ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-
-    # Verberg de navigatie-toolbar zodat hij slider-clicks niet blokkeert
-    try:
-        fig.canvas.manager.toolbar.setVisible(False)
-    except Exception:
-        pass
-
-    # Spectrum
-    with det._lock:
-        _f = det.freqs.copy(); _p = det.power.copy()
-    line_pwr,  = ax_spec.plot(_f, _p, color=CYAN,   lw=0.9, label="Vermogen")
-    line_base, = ax_spec.plot(_f, _p, color=ORANGE, lw=0.8, ls="--", alpha=0.6, label="Baseline")
-    ax_spec.set_xlim(_f[0], _f[-1]); ax_spec.set_ylim(-90, -10)
-    ax_spec.set_xlabel("Frequentie (MHz)", color=WHITE, fontsize=8)
-    ax_spec.set_ylabel("dBm", color=WHITE, fontsize=8)
-    ax_spec.set_title(f"Spectrum  ({_f[0]:.1f}–{_f[-1]:.1f} MHz)", color=WHITE, fontsize=10)
-    ax_spec.grid(True, alpha=0.12, color=WHITE)
-    ax_spec.legend(facecolor=BG, labelcolor=WHITE, fontsize=7, loc="upper right")
-    for cf in TETRA_FREQS:
-        ax_spec.axvline(cf, color=CYAN, alpha=0.15, lw=0.5)
-
-    # LED meters (24 segmenten, 4 kleuren)
-    N_CL = 24; SEG_MAX = 48.0; SEG_DB = SEG_MAX / N_CL
-    def seg_off(i):
-        if i >= 20: return "#3a0000"
-        if i >= 15: return "#3a1800"
-        if i >= 8:  return "#1e2a00"
-        return "#003316"
-    def seg_on(i):
-        if i >= 20: return "#ff3333"
-        if i >= 15: return "#ff8800"
-        if i >= 8:  return "#aaee00"
-        return "#22ee66"
-
-    ax_meter.set_facecolor("#0a0f14")
-    ax_meter.set_xlim(-0.5, 2.5); ax_meter.set_ylim(-6, SEG_MAX + 4)
-    ax_meter.set_title("Signaalsterkte — Top 3 kanalen", color=WHITE, fontsize=10)
-    ax_meter.set_xticks([0, 1, 2]); ax_meter.set_xticklabels(["", "", ""])
-    ax_meter.set_yticks([])
-    for sp in ax_meter.spines.values(): sp.set_color(GRAY)
-
-    SEG_W, SEG_H, SEG_GAP = 0.62, SEG_DB * 0.82, SEG_DB * 0.18
-    _segs = []
-    for ch in range(3):
-        ch_segs = []
-        for s in range(N_CL):
-            r = plt.Rectangle((ch - SEG_W/2, s * SEG_DB + SEG_GAP/2),
-                               SEG_W, SEG_H, facecolor=seg_off(s),
-                               edgecolor="none", zorder=2)
-            ax_meter.add_patch(r); ch_segs.append(r)
-        _segs.append(ch_segs)
-
-    thr_line  = ax_meter.axhline(det.threshold, color=RED, ls="--", lw=1.0, alpha=0.7)
-    _mfreq    = [ax_meter.text(ch, -2.5, "—", ha="center", va="top",
-                               fontsize=8, color=WHITE, fontweight="bold") for ch in range(3)]
-    _mdb      = [ax_meter.text(ch, 1, "", ha="center", va="bottom",
-                               fontsize=9, color=WHITE, fontweight="bold", zorder=5) for ch in range(3)]
-
-    # Alarm
-    ax_alrm.set_xlim(0, 1); ax_alrm.set_ylim(0, 1)
-    alrm_bg  = plt.Rectangle((0,0), 1, 1, transform=ax_alrm.transAxes, facecolor=PANEL, zorder=0)
-    ax_alrm.add_patch(alrm_bg)
-    alrm_txt = ax_alrm.text(0.5, 0.62, "● PRIOSENSE",
-                            ha="center", va="center", fontsize=13, fontweight="bold",
-                            color=WHITE, transform=ax_alrm.transAxes)
-    stat_txt = ax_alrm.text(0.5, 0.22, "—", ha="center", va="center",
-                            fontsize=9, color=ORANGE, transform=ax_alrm.transAxes)
-    ax_alrm.axis("off")
-
-    # Eigen drempel voor klassiek venster (onafhankelijk van hoofdvenster)
-    _cl_thr = [float(det.threshold)]
-
-    # Sliders
-    sl_thr  = _MplSlider(ax_thr,  "Drempel (dB)", 5,     50,  valinit=_cl_thr[0],        valstep=1,    color=RED)
-    sl_gain = _MplSlider(ax_gain, "Gain (dB)",    0,     49,  valinit=det.gain_db,        valstep=1,    color=CYAN)
-    sl_freq = _MplSlider(ax_freq, "Center (MHz)", 379.0, 386.0, valinit=det.center_freq/1e6, valstep=0.05, color=ORANGE)
-    for sl in [sl_thr, sl_gain, sl_freq]:
-        sl.label.set_color(WHITE); sl.valtext.set_color(WHITE); sl.ax.set_facecolor(PANEL)
-
-    def on_thr(v):
-        _cl_thr[0] = float(v)
-        thr_line.set_ydata([v, v])
-    def on_gain(v): det.auto_gain = False; det.set_gain(float(v), auto=False)
-    def on_freq(v):
-        det.set_center_freq(float(v))
-        nf = det._calc_freqs(int(round(float(v) * 1e6)))
-        line_pwr.set_xdata(nf); line_base.set_xdata(nf)
-        ax_spec.set_xlim(nf[0], nf[-1])
-        ax_spec.set_title(f"Spectrum  ({nf[0]:.1f}–{nf[-1]:.1f} MHz)", color=WHITE, fontsize=10)
-    sl_thr.on_changed(on_thr); sl_gain.on_changed(on_gain); sl_freq.on_changed(on_freq)
-
-    # Knoppen
-    btn_auto  = _MplButton(ax_auto,  "Auto Gain: UIT", color=PANEL, hovercolor=GRAY)
-    btn_reset = _MplButton(ax_reset, "Reset Baseline",  color=PANEL, hovercolor=GRAY)
-    for btn in [btn_auto, btn_reset]:
-        btn.label.set_color(WHITE); btn.label.set_fontsize(9)
-
-    def on_auto(e):
-        det.auto_gain = not det.auto_gain; det.set_gain(det.gain_db, auto=det.auto_gain)
-        btn_auto.label.set_text("Auto Gain: AAN" if det.auto_gain else "Auto Gain: UIT")
-        btn_auto.label.set_color(GREEN if det.auto_gain else WHITE)
-    def on_reset(e): det.reset_baseline()
-    btn_auto.on_clicked(on_auto); btn_reset.on_clicked(on_reset)
-
-    ax_info.axis("off")
-    ax_info.text(0.5, 0.5, f"Dongle #{DEVICE_IDX}  ·  SR: {SAMPLE_RATE/1e6:.1f} MHz  ·  FFT: {FFT_SIZE}",
-                 ha="center", va="center", fontsize=8, color=GRAY, transform=ax_info.transAxes)
-    ax_time.axis("off")
-    time_txt = ax_time.text(0.5, 0.5, "", ha="center", va="center",
-                            fontsize=8, color=GRAY, transform=ax_time.transAxes)
-
-    # Animatie — klassiek venster werkt volledig onafhankelijk van hoofdvenster
-    def update(_):
-        with det._lock:
-            pwr   = det.power.copy()
-            base  = det.baseline.copy() if det.baseline is not None else pwr.copy()
-            freqs = det.freqs.copy()
-            stat  = det.status
-        thr = _cl_thr[0]
-        hard_thr_cl = det.hard_threshold
-        line_pwr.set_ydata(pwr); line_base.set_ydata(base)
-        diff_arr = pwr - base
-        ch_vals = []
-        for cf in TETRA_FREQS:
-            if freqs[0] <= cf <= freqs[-1]:
-                idx = int(np.argmin(np.abs(freqs - cf)))
-                ch_vals.append((float(diff_arr[idx]), cf))
-        ch_vals.sort(key=lambda x: x[0], reverse=True)
-        while len(ch_vals) < 3: ch_vals.append((0.0, 0.0))
-        # Alarm berekend op eigen drempel (onafhankelijk van hoofdvenster)
-        best_cl = ch_vals[0][0] if ch_vals else 0.0
-        best_cf = ch_vals[0][1] if ch_vals else 0.0
-        cl_alrm = best_cl > thr
-        cl_red  = best_cl > hard_thr_cl
-        for ch in range(3):
-            db_val, freq_val = ch_vals[ch]
-            db_cl = max(0.0, min(db_val, SEG_MAX))
-            n_lit = int(db_cl / SEG_DB)
-            for s in range(N_CL):
-                _segs[ch][s].set_facecolor(seg_on(s) if s < n_lit else seg_off(s))
-            if freq_val > 0:
-                _mfreq[ch].set_text(f"{freq_val:.3f} MHz")
-                _mfreq[ch].set_color(RED if db_val > thr else WHITE)
-                _mdb[ch].set_text(f"+{max(0.0,db_val):.1f}")
-                _mdb[ch].set_color(RED if db_val > thr else GREEN)
-                _mdb[ch].set_y(db_cl + 0.5)
-            else:
-                _mfreq[ch].set_text("—"); _mfreq[ch].set_color(GRAY); _mdb[ch].set_text("")
-        if cl_alrm:
-            alrm_txt.set_text(f"⚠  TETRA  {best_cf:.3f} MHz  +{best_cl:.1f} dB  ⚠")
-            alrm_txt.set_color(RED if cl_red else ORANGE)
-            alrm_bg.set_facecolor(ALARM_BG)
-        else:
-            alrm_txt.set_text("● PRIOSENSE")
-            alrm_txt.set_color(WHITE if "Scan" in stat else ORANGE)
-            alrm_bg.set_facecolor(PANEL)
-        stat_txt.set_text(stat)
-        time_txt.set_text(datetime.now().strftime("%H:%M:%S") +
-                          f"  |  {freqs[0]:.1f}–{freqs[-1]:.1f} MHz")
-        thr_line.set_ydata([thr, thr])
-        return []
-
-    ani = _mpl_anim.FuncAnimation(fig, update, interval=500, blit=False, cache_frame_data=False)
-    ani._fig = fig
-    _CLASSIC_ANIS.append(ani)
-    plt.show(block=False)
-    return ani
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  PyQt6 GUI
 # ══════════════════════════════════════════════════════════════════════════════
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QFrame, QSizePolicy,
     QProgressBar, QDialog, QTabWidget, QStackedWidget, QComboBox, QLineEdit,
+    QScrollArea,
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal, QSettings
 from PyQt6.QtGui import (
@@ -1097,13 +867,6 @@ class SignalBarsWidget(QWidget):
                 p.drawText(lx, ly + 39, lw, 16,
                            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
                            arrow)
-                # ⚑ Bekend kanaal label
-                if round(freq, 3) in getattr(self, '_known_freqs', set()):
-                    p.setFont(_sys_font(7, bold=True))
-                    p.setPen(QColor("#ffd60a"))
-                    p.drawText(lx, ly + 55, lw, 16,
-                               int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                               "⚑ Bekend kanaal")
             else:
                 p.setFont(_sys_font(11, bold=True))
                 p.setPen(_qc("gray3"))
@@ -1119,7 +882,7 @@ class AlarmCard(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(90)
-        self.setMaximumHeight(115)
+        self.setMaximumHeight(135)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 10, 16, 10)
@@ -1141,9 +904,21 @@ class AlarmCard(QFrame):
         self.detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.detail)
 
+        self.activity = QLabel("")
+        self.activity.setFont(_sys_font(9, bold=True))
+        self.activity.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.activity)
+
         self._set("idle")
 
-    def _set(self, mode, freq=0.0, db=0.0):
+    @staticmethod
+    def _activity_text(n):
+        if n >= 4:   return "▪▪▪  Actief gesprek"
+        if n >= 2:   return "▪▪  Activiteit"
+        if n >= 1:   return "▪  Kort contact"
+        return ""
+
+    def _set(self, mode, freq=0.0, db=0.0, activity=0):
         styles = {
             "idle":   (C['panel'],  "1px solid " + C['sep'],    C['gray3'], C['gray1'], "—",                              C['gray3']),
             "orange": ("#2a1b00",   "2px solid " + C['orange'], C['orange'], C['white'], f"{freq:.3f} MHz  +{db:.1f} dB", C['orange']),
@@ -1161,10 +936,12 @@ class AlarmCard(QFrame):
         self.title.setStyleSheet(f"color: {title_col}; background: transparent;")
         self.detail.setText(detail_txt)
         self.detail.setStyleSheet(f"color: {detail_col}; background: transparent;")
+        self.activity.setText(self._activity_text(activity) if mode != "idle" else "")
+        self.activity.setStyleSheet(f"color: {detail_col}; background: transparent;")
 
-    def set_idle(self):           self._set("idle")
-    def set_orange(self, f, db): self._set("orange", f, db)
-    def set_red(self, f, db):    self._set("red",    f, db)
+    def set_idle(self):                       self._set("idle")
+    def set_orange(self, f, db, activity=0):  self._set("orange", f, db, activity)
+    def set_red(self, f, db, activity=0):     self._set("red",    f, db, activity)
 
 
 # ── LabeledSlider ─────────────────────────────────────────────────────────────
@@ -1272,125 +1049,6 @@ class WaterfallWindow(QMainWindow):
     def refresh(self, data, freqs):
         self._apply_transform(freqs, data.shape)
         self.img.setImage(data.T)
-
-
-# ── RawDataWidget ─────────────────────────────────────────────────────────────
-class RawDataWidget(QWidget):
-    PEAK_HOLD_S = 3.0
-
-    def __init__(self, det, parent=None):
-        super().__init__(parent)
-        self.det    = det
-        self._peaks = {}   # freq → (peak_db, expire_time)
-        self.setMinimumSize(380, 410)
-
-    def paintEvent(self, _event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        W, H = self.width(), self.height()
-        p.fillRect(0, 0, W, H, _qc("bg"))
-
-        # Titel
-        p.setFont(_sys_font(9, bold=True))
-        p.setPen(_qc("gray2"))
-        p.drawText(0, 2, W, 20,
-                   int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                   "RAW DATA — PrioSense")
-
-        with self.det._lock:
-            freqs      = self.det.freqs.copy()
-            slot_floor = self.det.slot_floor
-            raw_peaks  = dict(self.det.raw_peaks)   # peak-hold van detector loop
-
-        LABEL_W  = 56
-        DB_W     = 36
-        PAD_L    = 6
-        BAR_X    = PAD_L + LABEL_W + 4
-        BAR_MAX  = W - BAR_X - DB_W - 8
-        DB_SCALE = 50.0
-        ROW_H    = 19
-        BAR_H    = 9
-        start_y  = 26
-
-        now = time.time()
-        for i, cf in enumerate(TETRA_FREQS):
-            pk_db, pk_exp = raw_peaks.get(cf, (0.0, 0.0))
-            if now > pk_exp:
-                pk_db = 0.0   # peak verlopen
-            diff = pk_db      # huidige real-time diff niet apart beschikbaar, gebruik peak
-
-            y       = start_y + i * ROW_H
-            active  = pk_db > slot_floor
-            bar_y   = y + (ROW_H - BAR_H) // 2
-            bar_len = max(0, min(BAR_MAX, int(pk_db / DB_SCALE * BAR_MAX)))
-
-            # Rij-achtergrond
-            if active:
-                p.fillRect(2, y, W - 4, ROW_H - 2, QColor(36, 38, 46))
-
-            # Frequentie label
-            p.setFont(_sys_font(7, bold=active))
-            p.setPen(_qc("white") if active else _qc("gray3"))
-            p.drawText(PAD_L, y, LABEL_W, ROW_H,
-                       int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-                       f"{cf:.3f}")
-
-            # Balk achtergrond
-            p.fillRect(BAR_X, bar_y, BAR_MAX, BAR_H, QColor("#18181c"))
-
-            # Gekleurde balk (peak-hold waarde)
-            if bar_len > 0:
-                if pk_db < slot_floor:  bar_col = QColor(C['gray3'])
-                elif pk_db < 25:        bar_col = QColor(C['green'])
-                elif pk_db < 35:        bar_col = QColor(C['yellow'])
-                else:                   bar_col = QColor(C['red'])
-                p.fillRect(BAR_X, bar_y, bar_len, BAR_H, bar_col)
-
-            # Slot_floor streepje (oranje)
-            sf_x = BAR_X + int(slot_floor / DB_SCALE * BAR_MAX)
-            p.setPen(QColor(C['orange']))
-            p.drawLine(sf_x, y + 3, sf_x, y + ROW_H - 4)
-
-            # dB waarde (toont peak)
-            if active:
-                if pk_db < 25:  dc = _qc("green")
-                elif pk_db < 35: dc = _qc("yellow")
-                else:           dc = _qc("red")
-            else:
-                dc = _qc("gray3")
-            p.setFont(_sys_font(7))
-            p.setPen(dc)
-            sign = "+" if pk_db >= 0 else ""
-            p.drawText(BAR_X + BAR_MAX + 4, y, DB_W, ROW_H,
-                       int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-                       f"{sign}{pk_db:.0f}")
-
-        p.end()
-
-
-# ── RawDataWindow ─────────────────────────────────────────────────────────────
-class RawDataWindow(QMainWindow):
-    def __init__(self, det, parent=None):
-        super().__init__(parent)
-        self.det = det
-        self.setWindowTitle("Raw Data")
-        self.setFixedSize(390, 450)
-        self.setWindowFlags(
-            Qt.WindowType.Window |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool)
-        self.setStyleSheet(f"background-color: {C['bg']};")
-
-        self._raw = RawDataWidget(det)
-        self.setCentralWidget(self._raw)
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._raw.update)
-        self._timer.start(500)
-
-    def closeEvent(self, event):
-        self._timer.stop()
-        event.accept()
 
 
 # ── DetectionHistoryWidget ────────────────────────────────────────────────────
@@ -1788,6 +1446,15 @@ class MainWindow(QMainWindow):
         title.setStyleSheet(f"color: {C['gray1']}; letter-spacing: 2px;")
         main_vbox.addWidget(title)
 
+        # Statusbalk — verbinding, gain, AGR, modus in één oogopslag
+        self.status_bar = QLabel("●  Opstarten…")
+        self.status_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_bar.setFont(_sys_font(8, bold=True))
+        self.status_bar.setFixedHeight(22)
+        self.status_bar.setStyleSheet(
+            f"color:{C['gray2']}; background:{C['panel2']}; border-radius:5px;")
+        main_vbox.addWidget(self.status_bar)
+
         # Content rij
         content = QWidget()
         content_hbox = QHBoxLayout(content)
@@ -1797,34 +1464,14 @@ class MainWindow(QMainWindow):
 
         # ── Panel widgets aanmaken ────────────────────────────────────────────
         pg.setConfigOptions(antialias=True)
-        self.spec = pg.PlotWidget()
-        self.spec.setBackground(C['panel'])
-        self.spec.showGrid(x=True, y=True, alpha=0.08)
-        self.spec.setYRange(-90, -10)
-        self.spec.setXRange(det.freqs[0], det.freqs[-1])
-        self.spec.setLabel('left', 'dBm')
-        self.spec.setLabel('bottom', 'MHz')
-        self.spec.getAxis('left').setTextPen(QColor(C['gray2']))
-        self.spec.getAxis('bottom').setTextPen(QColor(C['gray2']))
-        self.spec.getAxis('left').setPen(QColor(C['sep']))
-        self.spec.getAxis('bottom').setPen(QColor(C['sep']))
-        self.spec.setMouseEnabled(x=False, y=False)
-        for cf in TETRA_FREQS:
-            self.spec.addItem(pg.InfiniteLine(pos=cf, angle=90,
-                pen=pg.mkPen(color=(10, 132, 255, 38), width=0.8)))
-        self.curve_pwr = self.spec.plot(det.freqs, det.power,
-            pen=pg.mkPen(color='#0a84ff', width=1.8))
-        base_pen = pg.mkPen(color='#ff9f0a', width=1.0)
-        base_pen.setStyle(Qt.PenStyle.DashLine)
-        self.curve_base = self.spec.plot(det.freqs, det.power, pen=base_pen)
-        legend = self.spec.addLegend(offset=(-10, 10))
-        legend.setLabelTextColor(C['gray2'])
-        legend.addItem(self.curve_pwr, 'Vermogen')
-        legend.addItem(self.curve_base, 'Baseline')
-
-        self.wfall_panel = WaterfallPanelWidget(det)
-        self.raw_panel   = RawDataWidget(det)
-        self.bars        = SignalBarsWidget()
+        # Twee onafhankelijke sets, zodat boven- en onderpaneel allebei vrij
+        # kunnen wisselen tussen Balken / Spectrum / Waterfall.
+        self.spec,  self.curve_pwr,  self.curve_base  = self._make_spectrum(det)
+        self.spec2, self.curve_pwr2, self.curve_base2 = self._make_spectrum(det)
+        self.wfall_panel  = WaterfallPanelWidget(det)
+        self.wfall_panel2 = WaterfallPanelWidget(det)
+        self.bars   = SignalBarsWidget()
+        self.bars2  = SignalBarsWidget()
         self.hist_panel  = DetectionHistoryWidget()
 
         # ── Linker kolom: 2 panel slots ───────────────────────────────────────
@@ -1834,12 +1481,12 @@ class MainWindow(QMainWindow):
         l_box.setSpacing(6)
 
         self.slot_top = PanelSlot(
-            names   = ["Spectrum", "Waterfall", "Raw Data"],
-            widgets = [self.spec, self.wfall_panel, self.raw_panel],
+            names   = ["Spectrum", "Waterfall", "Signaalbalken"],
+            widgets = [self.spec, self.wfall_panel, self.bars],
             initial_idx=0)
         self.slot_bot = PanelSlot(
-            names   = ["Signaalbalken"],
-            widgets = [self.bars],
+            names   = ["Signaalbalken", "Spectrum", "Waterfall"],
+            widgets = [self.bars2, self.spec2, self.wfall_panel2],
             initial_idx=0)
 
         l_box.addWidget(self.slot_top, stretch=2)
@@ -1869,6 +1516,12 @@ class MainWindow(QMainWindow):
         self.score_lbl.setFont(_sys_font(8))
         self.score_lbl.setStyleSheet(f"color: {C['gray2']};")
         tm_box.addWidget(self.score_lbl)
+        self.last_det_lbl = QLabel("Laatste detectie: —")
+        self.last_det_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.last_det_lbl.setFont(_sys_font(8))
+        self.last_det_lbl.setStyleSheet(f"color: {C['gray3']};")
+        tm_box.addWidget(self.last_det_lbl)
+        self._last_detection_time = None
         tm_box.addWidget(self._divider())
         tm_box.addWidget(self.hist_panel, stretch=1)
         tm_box.addWidget(self._divider())
@@ -2058,12 +1711,12 @@ class MainWindow(QMainWindow):
         btn_wfall = QPushButton("Waterfall venster")
         btn_wfall.clicked.connect(self._open_waterfall)
         ts_box.addWidget(btn_wfall)
-        btn_raw = QPushButton("Raw Data venster")
-        btn_raw.clicked.connect(self._open_raw)
-        ts_box.addWidget(btn_raw)
-        btn_klassiek = QPushButton("Klassiek")
-        btn_klassiek.clicked.connect(self._open_klassiek)
-        ts_box.addWidget(btn_klassiek)
+        self.btn_occ = QPushButton("🛡  Birdie-filter: AAN")
+        self.btn_occ.setMinimumHeight(34)
+        self.btn_occ.setFont(_sys_font(9))
+        self.btn_occ.setStyleSheet(f"color:{C['green']}; border-color:{C['green']};")
+        self.btn_occ.clicked.connect(self._toggle_occupancy)
+        ts_box.addWidget(self.btn_occ)
 
         self.btn_debug = QPushButton("⏺  Debug Log: UIT")
         self.btn_debug.setMinimumHeight(34)
@@ -2079,12 +1732,19 @@ class MainWindow(QMainWindow):
         self.btn_agr.clicked.connect(self._toggle_agr)
         ts_box.addWidget(self.btn_agr)
         ts_box.addStretch()
-        hint = QLabel("R=Reset  P=Politie  M=Modus  C=Compact")
+        hint = QLabel("R=Reset  M=Modus  C=Compact")
         hint.setFont(_sys_font(7))
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setStyleSheet(f"color: {C['gray3']};")
         ts_box.addWidget(hint)
-        self._tabs.addTab(tab_set, "Instellingen")
+
+        # Instellingen in scroll-gebied → niet samengedrukt bij klein venster
+        set_scroll = QScrollArea()
+        set_scroll.setWidgetResizable(True)
+        set_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        set_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        set_scroll.setWidget(tab_set)
+        self._tabs.addTab(set_scroll, "Instellingen")
 
         content_hbox.addWidget(self._tabs)
 
@@ -2095,35 +1755,24 @@ class MainWindow(QMainWindow):
         bot_lay.setContentsMargins(0, 4, 0, 0)
         bot_lay.setSpacing(10)
 
-        self.btn_police = QPushButton("🚨  POLITIE GEZIEN  [P]")
-        self.btn_police.setMinimumHeight(46)
-        self.btn_police.setFont(_sys_font(13, bold=True))
-        self.btn_police.setStyleSheet(f"""
-            QPushButton {{ background-color:#2d0b0a; color:{C['red']};
-                border:2px solid {C['red']}; border-radius:10px; }}
-            QPushButton:hover {{ background-color:#4a1110; color:white; }}
-            QPushButton:pressed {{ background-color:{C['red']}; color:white; }}
-        """)
-        self.btn_police.clicked.connect(self._on_police)
-        bot_lay.addWidget(self.btn_police, stretch=3)
-
         btn_compact = QPushButton("⊡  Compact  [C]")
         btn_compact.setMinimumHeight(46)
+        btn_compact.setFont(_sys_font(12, bold=True))
         btn_compact.clicked.connect(self._toggle_compact)
-        bot_lay.addWidget(btn_compact, stretch=1)
+        bot_lay.addWidget(btn_compact, stretch=2)
 
-        btn_bars_fs = QPushButton("▦")
+        btn_bars_fs = QPushButton("▦  Volledig scherm")
         btn_bars_fs.setMinimumHeight(46)
-        btn_bars_fs.setFixedWidth(46)
-        btn_bars_fs.setFont(_sys_font(16))
+        btn_bars_fs.setFont(_sys_font(12, bold=True))
         btn_bars_fs.setToolTip("Volledig scherm balkjes")
         btn_bars_fs.clicked.connect(self._open_bars_fullscreen)
-        bot_lay.addWidget(btn_bars_fs)
+        bot_lay.addWidget(btn_bars_fs, stretch=2)
 
         self.btn_mute = QPushButton("🔊  Geluid")
         self.btn_mute.setMinimumHeight(46)
+        self.btn_mute.setFont(_sys_font(12, bold=True))
         self.btn_mute.clicked.connect(self._toggle_mute)
-        bot_lay.addWidget(self.btn_mute, stretch=1)
+        bot_lay.addWidget(self.btn_mute, stretch=2)
 
         main_vbox.addWidget(bottom)
 
@@ -2141,18 +1790,62 @@ class MainWindow(QMainWindow):
         self._wfall_timer.timeout.connect(self._tick_waterfall)
         self._wfall_timer.start(100)
 
+    def _make_spectrum(self, det):
+        """Bouwt een spectrum-plot en geeft (widget, curve_pwr, curve_base) terug."""
+        spec = pg.PlotWidget()
+        spec.setBackground(C['panel'])
+        spec.showGrid(x=True, y=True, alpha=0.08)
+        spec.setYRange(-90, -10)
+        spec.setXRange(det.freqs[0], det.freqs[-1])
+        spec.setLabel('left', 'dBm')
+        spec.setLabel('bottom', 'MHz')
+        spec.getAxis('left').setTextPen(QColor(C['gray2']))
+        spec.getAxis('bottom').setTextPen(QColor(C['gray2']))
+        spec.getAxis('left').setPen(QColor(C['sep']))
+        spec.getAxis('bottom').setPen(QColor(C['sep']))
+        spec.setMouseEnabled(x=False, y=False)
+        for cf in DISPLAY_GRID:
+            spec.addItem(pg.InfiniteLine(pos=cf, angle=90,
+                pen=pg.mkPen(color=(10, 132, 255, 38), width=0.8)))
+        curve_pwr = spec.plot(det.freqs, det.power,
+            pen=pg.mkPen(color='#0a84ff', width=1.8))
+        base_pen = pg.mkPen(color='#ff9f0a', width=1.0)
+        base_pen.setStyle(Qt.PenStyle.DashLine)
+        curve_base = spec.plot(det.freqs, det.power, pen=base_pen)
+        legend = spec.addLegend(offset=(-10, 10))
+        legend.setLabelTextColor(C['gray2'])
+        legend.addItem(curve_pwr, 'Vermogen')
+        legend.addItem(curve_base, 'Baseline')
+        return spec, curve_pwr, curve_base
+
     def _tick_waterfall(self):
+        """Snelle timer (100ms) — spectrum en waterfall, vangt korte bursts."""
         try:
-            want_wfall = ((self._wfall_win is not None and self._wfall_win.isVisible()) or
-                          self.slot_top.current_name() == "Waterfall")
-            if not want_wfall:
+            top_name = self.slot_top.current_name()
+            bot_name = self.slot_bot.current_name()
+            ext_wf   = (self._wfall_win is not None and self._wfall_win.isVisible())
+            want_wfall = ext_wf or top_name == "Waterfall" or bot_name == "Waterfall"
+            want_spec  = (top_name == "Spectrum" or bot_name == "Spectrum")
+            if not (want_wfall or want_spec):
                 return
             with self.det._lock:
-                wfall_data = self.det.wfall.copy()
                 freqs      = self.det.freqs.copy()
-            if self.slot_top.current_name() == "Waterfall":
+                pwr        = self.det.power.copy() if want_spec else None
+                base       = ((self.det.baseline.copy()
+                               if self.det.baseline is not None else pwr.copy())
+                              if want_spec else None)
+                wfall_data = self.det.wfall.copy() if want_wfall else None
+            # Spectrum (boven en/of onder)
+            if top_name == "Spectrum":
+                self.curve_pwr.setData(freqs, pwr);  self.curve_base.setData(freqs, base)
+            if bot_name == "Spectrum":
+                self.curve_pwr2.setData(freqs, pwr); self.curve_base2.setData(freqs, base)
+            # Waterfall (boven en/of onder)
+            if top_name == "Waterfall" and wfall_data is not None:
                 self.wfall_panel.refresh(wfall_data, freqs)
-            if self._wfall_win is not None and self._wfall_win.isVisible():
+            if bot_name == "Waterfall" and wfall_data is not None:
+                self.wfall_panel2.refresh(wfall_data, freqs)
+            if ext_wf and wfall_data is not None:
                 self._wfall_win.refresh(wfall_data, freqs)
         except Exception:
             pass
@@ -2224,28 +1917,6 @@ class MainWindow(QMainWindow):
         self.btn_mode.setStyleSheet(f"color:{col}; border-color:{col};")
         self.btn_mode_info.setStyleSheet(f"color:{col}; border-color:{col};")
         self._custom_section.setVisible(self._mode_idx == 1)
-
-    def _on_police(self):
-        self.det._log_police()
-        self._beep_police()
-        # Frequentie geheugen — sla sterkste freq van laatste 2 min op
-        best = self.det.get_best_freq_last_2min()
-        if best is not None:
-            self.det.save_known_freq(best)
-
-    def _beep_police(self):
-        """Knipperende knop + beep als bevestiging."""
-        original_style = self.btn_police.styleSheet()
-        self.btn_police.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {C['red']};
-                color: white;
-                border: 2px solid {C['red']};
-                border-radius: 10px;
-            }}
-        """)
-        threading.Thread(target=_play_beep, daemon=True).start()
-        QTimer.singleShot(400, lambda: self.btn_police.setStyleSheet(original_style))
 
     def _on_gain(self, v):
         self.det.auto_gain = False
@@ -2354,8 +2025,6 @@ class MainWindow(QMainWindow):
         k = event.key()
         if k == Qt.Key.Key_R:
             self.det.reset_baseline()
-        elif k == Qt.Key.Key_P:
-            self._on_police()
         elif k == Qt.Key.Key_M:
             self._on_mode()
         elif k == Qt.Key.Key_C:
@@ -2380,8 +2049,14 @@ class MainWindow(QMainWindow):
             self._compact_win.activateWindow()
             self.hide()
 
-    def _open_klassiek(self):
-        open_classic_view(self.det)
+    def _toggle_occupancy(self):
+        self.det.occupancy_check = not self.det.occupancy_check
+        if self.det.occupancy_check:
+            self.btn_occ.setText("🛡  Birdie-filter: AAN")
+            self.btn_occ.setStyleSheet(f"color:{C['green']}; border-color:{C['green']};")
+        else:
+            self.btn_occ.setText("🛡  Birdie-filter: UIT")
+            self.btn_occ.setStyleSheet(f"color:{C['gray2']}; border-color:{C['sep']};")
 
     def _toggle_agr(self):
         self.det.agr_enabled = not self.det.agr_enabled
@@ -2410,13 +2085,6 @@ class MainWindow(QMainWindow):
             self.btn_debug.setText("⏺  Debug Log: UIT")
             self.btn_debug.setStyleSheet(f"color:{C['gray2']}; border-color:{C['sep']};")
 
-    def _open_raw(self):
-        if self._raw_win is not None and self._raw_win.isVisible():
-            self._raw_win.raise_()
-            return
-        self._raw_win = RawDataWindow(self.det, parent=self)
-        self._raw_win.show()
-
     def _open_waterfall(self):
         if self._wfall_win is not None and self._wfall_win.isVisible():
             self._wfall_win.raise_()
@@ -2433,26 +2101,18 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def _tick_inner(self):
-        want_wfall = ((self._wfall_win is not None and self._wfall_win.isVisible()) or
-                      self.slot_top.current_name() == "Waterfall")
         with self.det._lock:
-            pwr        = self.det.power.copy()
-            base       = (self.det.baseline.copy()
-                          if self.det.baseline is not None else pwr.copy())
-            freqs      = self.det.freqs.copy()
             alarm      = self.det.alarm
             alvl       = self.det.alarm_level
             afrq       = self.det.alarm_freq
             adb        = self.det.alarm_db
             stat       = self.det.status
             slots_snap = [dict(s) for s in self.det.slots]
-            wfall_data = self.det.wfall.copy() if want_wfall else None
             agr_active = self.det.agr_active
             gain_now   = self.det.gain_db
-            known_freqs = self.det.known_freqs
+            activity   = self.det.alarm_activity
 
-        self.curve_pwr.setData(freqs, pwr)
-        self.curve_base.setData(freqs, base)
+        # (Spectrum en waterfall worden in de snelle 100ms timer bijgewerkt)
 
         # Trend berekenen per slot
         trends = []
@@ -2471,8 +2131,9 @@ class MainWindow(QMainWindow):
                 trends.append(0)
 
         self.bars.update_data(slots_snap, self.det.threshold, self.det.slot_floor, trends,
-                              hard_threshold=self.det.hard_threshold,
-                              known_freqs=known_freqs)
+                              hard_threshold=self.det.hard_threshold)
+        self.bars2.update_data(slots_snap, self.det.threshold, self.det.slot_floor, trends,
+                               hard_threshold=self.det.hard_threshold)
 
         # AGR badge + live gain
         if agr_active:
@@ -2489,16 +2150,15 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_bars_fs_win') and self._bars_fs_win and self._bars_fs_win.isVisible():
             self._bars_fs_win.bars.update_data(slots_snap, self.det.threshold,
                                                self.det.slot_floor, trends,
-                                               hard_threshold=self.det.hard_threshold,
-                                               known_freqs=known_freqs)
+                                               hard_threshold=self.det.hard_threshold)
 
         if not alarm:
             self.alarm_card.set_idle()
             self._compact_win.alarm_card.set_idle()
             self._hulp_alert.hide_alert()
         elif alvl == 2:
-            self.alarm_card.set_red(afrq, adb)
-            self._compact_win.alarm_card.set_red(afrq, adb)
+            self.alarm_card.set_red(afrq, adb, activity)
+            self._compact_win.alarm_card.set_red(afrq, adb, activity)
             if not self._hulp_alert.isVisible():
                 self._hulp_alert.show_alert(afrq, adb)
                 # Windows toast als geminimaliseerd
@@ -2507,8 +2167,8 @@ class MainWindow(QMainWindow):
             else:
                 self._hulp_alert.update_alert(afrq, adb)
         else:
-            self.alarm_card.set_orange(afrq, adb)
-            self._compact_win.alarm_card.set_orange(afrq, adb)
+            self.alarm_card.set_orange(afrq, adb, activity)
+            self._compact_win.alarm_card.set_orange(afrq, adb, activity)
             self._hulp_alert.hide_alert()
 
         # Detectie geschiedenis bijwerken bij nieuwe alarm
@@ -2524,14 +2184,7 @@ class MainWindow(QMainWindow):
                 slots_snap, self.det.threshold, self.det.slot_floor, trends,
                 hard_threshold=self.det.hard_threshold)
 
-        # Waterfall panel updaten als zichtbaar
-        top_name = self.slot_top.current_name()
-        if top_name == "Waterfall" and wfall_data is not None:
-            self.wfall_panel.refresh(wfall_data, freqs)
-
-        # Raw data panel updaten
-        if top_name == "Raw Data":
-            self.raw_panel.update()
+        # (Waterfall wordt in de snelle 100ms timer bijgewerkt)
 
         # Sessie score bijwerken
         if alarm and adb > 0:
@@ -2541,6 +2194,28 @@ class MainWindow(QMainWindow):
         self.score_lbl.setText(
             f"Sessie: {n} detecties  ·  gem. +{avg:.0f} dB" if n
             else "Sessie: geen detecties nog")
+
+        # Statusbalk bijwerken
+        verbonden = (stat == "Scannen")
+        conn_dot  = "🟢" if verbonden else "🟡"
+        agr_txt   = "AGR●" if agr_active else ("AGR" if self.det.agr_enabled else "—")
+        self.status_bar.setText(
+            f"{conn_dot} {stat}   ·   {gain_now:.0f} dB   ·   {agr_txt}   ·   {self.det.mode_name}")
+        self.status_bar.setStyleSheet(
+            f"color:{C['gray1']}; background:{C['panel2']}; border-radius:5px;")
+
+        # Laatste detectie tijd
+        if alarm and adb > 0:
+            self._last_detection_time = time.time()
+        if self._last_detection_time is not None:
+            elapsed = time.time() - self._last_detection_time
+            if elapsed < 60:
+                txt = f"{int(elapsed)}s geleden"
+            elif elapsed < 3600:
+                txt = f"{int(elapsed/60)}m geleden"
+            else:
+                txt = f"{int(elapsed/3600)}u geleden"
+            self.last_det_lbl.setText(f"Laatste detectie: {txt}")
 
         # Test modus data verzamelen
         if self._test_running:
@@ -2560,9 +2235,6 @@ class MainWindow(QMainWindow):
 
         self.stat_lbl.setText(stat)
         self.time_lbl.setText(datetime.now().strftime("%H:%M:%S"))
-
-        if wfall_data is not None and self._wfall_win is not None and self._wfall_win.isVisible():
-            self._wfall_win.refresh(wfall_data, freqs)
 
     def closeEvent(self, event):
         # Instellingen opslaan
@@ -2586,8 +2258,6 @@ class MainWindow(QMainWindow):
         self.det.stop()
         if self._wfall_win:
             self._wfall_win.close()
-        if self._raw_win:
-            self._raw_win.close()
         event.accept()
 
 
