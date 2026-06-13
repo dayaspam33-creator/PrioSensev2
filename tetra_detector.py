@@ -621,7 +621,8 @@ from PyQt6.QtWidgets import (
     QProgressBar, QDialog, QTabWidget, QStackedWidget, QComboBox, QLineEdit,
     QScrollArea,
 )
-from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal, QSettings
+from PyQt6.QtCore import (Qt, QTimer, QRectF, pyqtSignal, QSettings,
+                          QPropertyAnimation, pyqtProperty, QEasingCurve)
 from PyQt6.QtGui import (
     QPainter, QColor, QFont, QPainterPath, QTransform, QIcon, QPixmap, QPen,
 )
@@ -994,6 +995,119 @@ class LabeledSlider(QWidget):
 
     def value(self):
         return self._lo + self.slider.value() * self._step
+
+
+# ── ToggleSwitch (macOS-stijl) ────────────────────────────────────────────────
+class ToggleSwitch(QWidget):
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, checked=False, on_color=None, parent=None):
+        super().__init__(parent)
+        self._checked  = bool(checked)
+        self._knob     = 1.0 if checked else 0.0
+        self._on_color = QColor(on_color or C['green'])
+        self.setFixedSize(46, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._anim = QPropertyAnimation(self, b"knob", self)
+        self._anim.setDuration(150)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+    def isChecked(self):
+        return self._checked
+
+    def setChecked(self, val, emit=False):
+        val = bool(val)
+        if val == self._checked:
+            return
+        self._checked = val
+        self._anim.stop()
+        self._anim.setStartValue(self._knob)
+        self._anim.setEndValue(1.0 if val else 0.0)
+        self._anim.start()
+        if emit:
+            self.toggled.emit(val)
+
+    def mousePressEvent(self, _e):
+        self.setChecked(not self._checked, emit=True)
+
+    def _get_knob(self): return self._knob
+    def _set_knob(self, v):
+        self._knob = v
+        self.update()
+    knob = pyqtProperty(float, _get_knob, _set_knob)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        off = QColor(C['gray3'])
+        on  = self._on_color
+        k   = self._knob
+        track = QColor(int(off.red()   + (on.red()   - off.red())   * k),
+                       int(off.green() + (on.green() - off.green()) * k),
+                       int(off.blue()  + (on.blue()  - off.blue())  * k))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(0, 0, W, H), H / 2, H / 2)
+        d  = H - 6
+        x  = 3 + (W - 6 - d) * k
+        p.setBrush(QColor("#ffffff"))
+        p.drawEllipse(QRectF(x, 3, d, d))
+        p.end()
+
+
+# ── Instellingen-kaart & -rij (iOS-stijl) ─────────────────────────────────────
+class SettingsRow(QWidget):
+    """Rij met titel (+ optioneel subtitel) links en een control rechts."""
+    def __init__(self, title, control=None, subtitle=None, parent=None):
+        super().__init__(parent)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(12, 9, 12, 9)
+        h.setSpacing(10)
+        vt = QVBoxLayout(); vt.setSpacing(1); vt.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(title); lbl.setFont(_sys_font(11))
+        lbl.setStyleSheet(f"color:{C['gray1']}; background:transparent;")
+        vt.addWidget(lbl)
+        if subtitle:
+            sub = QLabel(subtitle); sub.setFont(_sys_font(8))
+            sub.setStyleSheet(f"color:{C['gray2']}; background:transparent;")
+            sub.setWordWrap(True)
+            vt.addWidget(sub)
+        h.addLayout(vt, stretch=1)
+        if control is not None:
+            h.addWidget(control, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+
+class SettingsGroup(QWidget):
+    """Sectie met grijs kopje + afgeronde kaart die rijen bevat."""
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(5)
+        hdr = QLabel(title.upper())
+        hdr.setFont(_sys_font(8, bold=True))
+        hdr.setStyleSheet(f"color:{C['gray2']}; letter-spacing:1px;"
+                          " background:transparent; padding-left:8px;")
+        v.addWidget(hdr)
+        self._card = QFrame()
+        self._card.setObjectName("settingsCard")
+        self._card.setStyleSheet(
+            f"QFrame#settingsCard {{ background:{C['panel']};"
+            f" border:1px solid {C['sep']}; border-radius:12px; }}")
+        self._cv = QVBoxLayout(self._card)
+        self._cv.setContentsMargins(0, 2, 0, 2)
+        self._cv.setSpacing(0)
+        v.addWidget(self._card)
+
+    def add(self, widget, divider=True):
+        if self._cv.count() > 0 and divider:
+            line = QFrame()
+            line.setFixedHeight(1)
+            line.setStyleSheet(f"background:{C['sep']}; border:none;"
+                               " margin-left:12px; margin-right:12px;")
+            self._cv.addWidget(line)
+        self._cv.addWidget(widget)
 
 
 # ── WaterfallWindow ───────────────────────────────────────────────────────────
@@ -1548,137 +1662,49 @@ class MainWindow(QMainWindow):
         tm_box.addWidget(self.time_lbl)
         self._tabs.addTab(tab_mon, "Monitor")
 
-        # Tab Instellingen
+        # ── Tab Instellingen — gegroepeerde kaarten (Apple-stijl) ─────────────
         tab_set = QWidget()
         ts_box  = QVBoxLayout(tab_set)
-        ts_box.setContentsMargins(8, 8, 8, 8)
-        ts_box.setSpacing(8)
-        self.sl_thr = LabeledSlider("Drempel dB", 5, 50, det.threshold,
-            step=1.0, color=C['red'])
-        self.sl_thr.valueChanged.connect(lambda v: setattr(self.det, 'threshold', v))
-        ts_box.addWidget(self._panel(self.sl_thr))
-        self.sl_gain = LabeledSlider("Gain dB", 0, 49, det.gain_db,
-            step=1.0, color=C['blue'])
-        self.sl_gain.valueChanged.connect(self._on_gain)
-        ts_box.addWidget(self._panel(self.sl_gain))
-        self.sl_freq = LabeledSlider("Center MHz", 379.0, 386.0, det.center_freq / 1e6,
-            step=0.05, fmt="{:.2f}", color=C['orange'])
-        self.sl_freq.valueChanged.connect(self._on_freq)
-        ts_box.addWidget(self._panel(self.sl_freq))
+        ts_box.setContentsMargins(10, 12, 10, 12)
+        ts_box.setSpacing(16)
 
-        # Verbindingsmodus dropdown
-        conn_row = QWidget()
-        conn_hlay = QHBoxLayout(conn_row)
-        conn_hlay.setContentsMargins(0, 0, 0, 0)
-        conn_hlay.setSpacing(6)
-        conn_lbl = QLabel("Modus:")
-        conn_lbl.setFont(_sys_font(9))
-        conn_lbl.setStyleSheet(f"color:{C['gray2']};")
-        conn_hlay.addWidget(conn_lbl)
-        self._conn_combo = QComboBox()
-        self._conn_combo.setFixedHeight(28)
-        self._conn_combo.setFont(_sys_font(9))
-        self._conn_combo.setStyleSheet(f"""
-            QComboBox {{
-                background:{C['panel2']}; color:{C['gray1']};
-                border:1px solid {C['sep']}; border-radius:5px; padding:0 8px;
-            }}
-            QComboBox:hover {{ border-color:{C['blue']}; }}
-            QComboBox QAbstractItemView {{
-                background:{C['panel2']}; color:{C['white']};
-                selection-background-color:{C['panel']};
-            }}
-        """)
-        for mode_name in CONNECTION_MODES:
-            self._conn_combo.addItem(mode_name)
-        saved_conn = self._settings.value("connection_mode", "PC")
-        if saved_conn in CONNECTION_MODES:
-            self._conn_combo.setCurrentText(saved_conn)
-            det.connection_mode = saved_conn
-        self._conn_combo.currentTextChanged.connect(self._on_conn_mode)
-        conn_hlay.addWidget(self._conn_combo, stretch=1)
-        ts_box.addWidget(conn_row)
+        _combo_qss = (f"QComboBox {{ background:{C['panel2']}; color:{C['gray1']};"
+                      f" border:1px solid {C['sep']}; border-radius:6px; padding:2px 8px; }}"
+                      f" QComboBox:hover {{ border-color:{C['blue']}; }}"
+                      f" QComboBox QAbstractItemView {{ background:{C['panel2']};"
+                      f" color:{C['white']}; selection-background-color:{C['panel']}; }}")
 
-        # IP-adres invoer (alleen zichtbaar in Android modus)
-        self._ip_row = QWidget()
-        ip_hlay = QHBoxLayout(self._ip_row)
-        ip_hlay.setContentsMargins(0, 0, 0, 0)
-        ip_hlay.setSpacing(6)
-        ip_lbl = QLabel("Telefoon IP:")
-        ip_lbl.setFont(_sys_font(9))
-        ip_lbl.setStyleSheet(f"color:{C['gray2']};")
-        ip_hlay.addWidget(ip_lbl)
-        self._ip_edit = QLineEdit(self._settings.value("android_host", "192.168.0.144"))
-        self._ip_edit.setFixedHeight(28)
-        self._ip_edit.setFont(_sys_font(9))
-        self._ip_edit.setPlaceholderText("bijv. 192.168.0.144")
-        self._ip_edit.setStyleSheet(f"""
-            QLineEdit {{
-                background:{C['panel2']}; color:{C['blue']};
-                border:1px solid {C['blue']}; border-radius:5px; padding:0 8px;
-            }}
-        """)
-        self._ip_edit.textChanged.connect(self._on_android_ip)
-        ip_hlay.addWidget(self._ip_edit, stretch=1)
-        ts_box.addWidget(self._ip_row)
-        self._ip_row.setVisible(det.connection_mode == "Android")
-        det.android_host = self._settings.value("android_host", "192.168.0.144")
-        ts_box.addWidget(self._divider())
+        def _slider_row(sl):
+            w = QWidget()
+            wl = QVBoxLayout(w); wl.setContentsMargins(12, 8, 12, 8); wl.setSpacing(0)
+            wl.addWidget(sl)
+            return w
 
-        # Band venster dropdown
-        band_presets = [
-            ("Volledig (382.0)",  382.0),
-            ("Laag   380–382",    381.0),
-            ("Midden 381–383",    382.0),
-            ("Hoog   382–384",    383.0),
-            ("Top    383–385",    384.0),
-        ]
-        self._band_combo = QComboBox()
-        self._band_combo.setFixedHeight(28)
-        self._band_combo.setFont(_sys_font(8))
-        self._band_combo.setStyleSheet(f"""
-            QComboBox {{
-                background:{C['panel2']}; color:{C['gray2']};
-                border:1px solid {C['sep']}; border-radius:5px; padding:0 8px;
-            }}
-            QComboBox:hover {{ border-color:{C['orange']}; color:{C['white']}; }}
-            QComboBox QAbstractItemView {{
-                background:{C['panel2']}; color:{C['white']};
-                selection-background-color:{C['panel']};
-            }}
-        """)
-        for label, _ in band_presets:
-            self._band_combo.addItem(label)
-        self._band_freqs = [mhz for _, mhz in band_presets]
-        self._band_combo.currentIndexChanged.connect(self._on_band_select)
-        ts_box.addWidget(self._band_combo)
-        ts_box.addWidget(self._divider())
         self._mode_idx = saved_mode
 
-        # Modus rij: naam knop + ⓘ info knop
-        mode_row = QWidget()
-        mode_hlay = QHBoxLayout(mode_row)
-        mode_hlay.setContentsMargins(0, 0, 0, 0)
-        mode_hlay.setSpacing(6)
+        # ═══ GEVOELIGHEID ═══════════════════════════════════════════════════
+        grp_sens = SettingsGroup("Gevoeligheid")
         self.btn_mode = QPushButton(MODES[self._mode_idx]["name"])
         _mc = MODE_COLORS[MODES[self._mode_idx]["name"]]
         self.btn_mode.setStyleSheet(f"color:{_mc}; border-color:{_mc};")
-        self.btn_mode.setMinimumHeight(34)
+        self.btn_mode.setMinimumHeight(30)
+        self.btn_mode.setMinimumWidth(92)
         self.btn_mode.clicked.connect(self._on_mode)
-        mode_hlay.addWidget(self.btn_mode, stretch=1)
         self.btn_mode_info = QPushButton("ⓘ")
-        self.btn_mode_info.setFixedSize(34, 34)
-        self.btn_mode_info.setFont(_sys_font(14))
-        self.btn_mode_info.setStyleSheet(f"color:{C['gray2']}; border-color:{C['sep']};")
+        self.btn_mode_info.setFixedSize(30, 30)
+        self.btn_mode_info.setFont(_sys_font(13))
+        self.btn_mode_info.setStyleSheet(f"color:{_mc}; border-color:{_mc};")
         self.btn_mode_info.clicked.connect(self._show_mode_info)
-        mode_hlay.addWidget(self.btn_mode_info)
-        ts_box.addWidget(mode_row)
+        mode_ctrl = QWidget()
+        mc_l = QHBoxLayout(mode_ctrl); mc_l.setContentsMargins(0, 0, 0, 0); mc_l.setSpacing(6)
+        mc_l.addWidget(self.btn_mode); mc_l.addWidget(self.btn_mode_info)
+        grp_sens.add(SettingsRow("Rijmodus", mode_ctrl, "Stad · Custom · Snelweg"))
 
-        # Custom modus sliders
-        self._custom_section = QWidget()
-        cs_box = QVBoxLayout(self._custom_section)
-        cs_box.setContentsMargins(0, 0, 0, 0)
-        cs_box.setSpacing(4)
+        self.sl_thr = LabeledSlider("Drempel dB", 5, 50, det.threshold,
+            step=1.0, color=C['red'])
+        self.sl_thr.valueChanged.connect(lambda v: setattr(self.det, 'threshold', v))
+        grp_sens.add(_slider_row(self.sl_thr))
+
         custom = MODES[1]  # Custom is altijd index 1
         self.sl_custom_floor = LabeledSlider("Custom vloer dB",   0,  40, custom["slot_floor"],     step=1.0, color=C['gray2'])
         self.sl_custom_thr   = LabeledSlider("Custom oranje dB",  5,  50, custom["threshold"],      step=1.0, color=C['orange'])
@@ -1688,51 +1714,113 @@ class MainWindow(QMainWindow):
         self.sl_custom_thr  .valueChanged.connect(lambda v: self._update_custom("threshold",      v))
         self.sl_custom_hard .valueChanged.connect(lambda v: self._update_custom("hard_threshold", v))
         self.sl_custom_hang .valueChanged.connect(lambda v: self._update_custom("hang_time",      v))
+        self._custom_section = QWidget()
+        cs_box = QVBoxLayout(self._custom_section); cs_box.setContentsMargins(0, 0, 0, 0); cs_box.setSpacing(0)
         for sl in [self.sl_custom_floor, self.sl_custom_thr, self.sl_custom_hard, self.sl_custom_hang]:
-            cs_box.addWidget(self._panel(sl))
+            line = QFrame(); line.setFixedHeight(1)
+            line.setStyleSheet(f"background:{C['sep']}; border:none; margin-left:12px; margin-right:12px;")
+            cs_box.addWidget(line); cs_box.addWidget(_slider_row(sl))
         self._custom_section.setVisible(self._mode_idx == 1)
-        ts_box.addWidget(self._custom_section)
-        self.btn_auto = QPushButton("Auto Gain  UIT")
-        self.btn_auto.clicked.connect(self._on_auto)
-        ts_box.addWidget(self.btn_auto)
-        btn_reset = QPushButton("Reset Baseline  [R]")
+        grp_sens.add(self._custom_section, divider=False)
+        ts_box.addWidget(grp_sens)
+
+        # ═══ ONTVANGER ══════════════════════════════════════════════════════
+        grp_recv = SettingsGroup("Ontvanger")
+        self.sl_gain = LabeledSlider("Gain dB", 0, 49, det.gain_db,
+            step=1.0, color=C['blue'])
+        self.sl_gain.valueChanged.connect(self._on_gain)
+        grp_recv.add(_slider_row(self.sl_gain))
+
+        self.sw_auto = ToggleSwitch(det.auto_gain, on_color=C['blue'])
+        self.sw_auto.toggled.connect(self._on_auto)
+        grp_recv.add(SettingsRow("Auto Gain", self.sw_auto, "Dongle regelt versterking zelf"))
+
+        self.sl_freq = LabeledSlider("Center MHz", 379.0, 386.0, det.center_freq / 1e6,
+            step=0.05, fmt="{:.2f}", color=C['orange'])
+        self.sl_freq.valueChanged.connect(self._on_freq)
+        grp_recv.add(_slider_row(self.sl_freq))
+
+        band_presets = [
+            ("Volledig (382.0)",  382.0),
+            ("Laag   380–382",    381.0),
+            ("Midden 381–383",    382.0),
+            ("Hoog   382–384",    383.0),
+            ("Top    383–385",    384.0),
+        ]
+        self._band_combo = QComboBox()
+        self._band_combo.setFixedHeight(28)
+        self._band_combo.setMinimumWidth(150)
+        self._band_combo.setFont(_sys_font(8))
+        self._band_combo.setStyleSheet(_combo_qss)
+        for label, _ in band_presets:
+            self._band_combo.addItem(label)
+        self._band_freqs = [mhz for _, mhz in band_presets]
+        self._band_combo.currentIndexChanged.connect(self._on_band_select)
+        grp_recv.add(SettingsRow("Bandvenster", self._band_combo))
+
+        self._conn_combo = QComboBox()
+        self._conn_combo.setFixedHeight(28)
+        self._conn_combo.setMinimumWidth(150)
+        self._conn_combo.setFont(_sys_font(9))
+        self._conn_combo.setStyleSheet(_combo_qss)
+        for mode_name in CONNECTION_MODES:
+            self._conn_combo.addItem(mode_name)
+        saved_conn = self._settings.value("connection_mode", "PC")
+        if saved_conn in CONNECTION_MODES:
+            self._conn_combo.setCurrentText(saved_conn)
+            det.connection_mode = saved_conn
+        self._conn_combo.currentTextChanged.connect(self._on_conn_mode)
+        grp_recv.add(SettingsRow("Verbinding", self._conn_combo, "PC of telefoon"))
+
+        self._ip_edit = QLineEdit(self._settings.value("android_host", "192.168.0.144"))
+        self._ip_edit.setFixedHeight(28)
+        self._ip_edit.setMinimumWidth(150)
+        self._ip_edit.setFont(_sys_font(9))
+        self._ip_edit.setPlaceholderText("bijv. 192.168.0.144")
+        self._ip_edit.setStyleSheet(
+            f"QLineEdit {{ background:{C['panel2']}; color:{C['blue']};"
+            f" border:1px solid {C['blue']}; border-radius:6px; padding:2px 8px; }}")
+        self._ip_edit.textChanged.connect(self._on_android_ip)
+        self._ip_row = SettingsRow("Telefoon IP", self._ip_edit)
+        grp_recv.add(self._ip_row)
+        self._ip_row.setVisible(det.connection_mode == "Android")
+        det.android_host = self._settings.value("android_host", "192.168.0.144")
+        ts_box.addWidget(grp_recv)
+
+        # ═══ FILTERS ════════════════════════════════════════════════════════
+        grp_filt = SettingsGroup("Filters")
+        self.sw_adaptive = ToggleSwitch(det.adaptive_filter, on_color=C['green'])
+        self.sw_adaptive.toggled.connect(self._on_adaptive)
+        grp_filt.add(SettingsRow("Storingsfilter", self.sw_adaptive,
+                                 "Onderdrukt langdurige storing tijdens rijden"))
+        self.sw_occ = ToggleSwitch(det.occupancy_check, on_color=C['green'])
+        self.sw_occ.toggled.connect(self._toggle_occupancy)
+        grp_filt.add(SettingsRow("Birdie-filter", self.sw_occ,
+                                 "Filtert vaste dongle-spoken weg"))
+        self.sw_agr = ToggleSwitch(det.agr_enabled, on_color=C['green'])
+        self.sw_agr.toggled.connect(self._toggle_agr)
+        grp_filt.add(SettingsRow("AGR", self.sw_agr,
+                                 "Automatische gain-reductie bij hard alarm"))
+        ts_box.addWidget(grp_filt)
+
+        # ═══ SYSTEEM ════════════════════════════════════════════════════════
+        grp_sys = SettingsGroup("Systeem")
+        btn_reset = QPushButton("Reset")
+        btn_reset.setMinimumHeight(28); btn_reset.setMinimumWidth(80)
         btn_reset.clicked.connect(det.reset_baseline)
-        ts_box.addWidget(btn_reset)
-
-        self.btn_adaptive = QPushButton("🛡  Storingsfilter  UIT")
-        self.btn_adaptive.setMinimumHeight(34)
-        self.btn_adaptive.clicked.connect(self._on_adaptive)
-        ts_box.addWidget(self.btn_adaptive)
-        if det.adaptive_filter:
-            self.btn_adaptive.setText("🛡  Storingsfilter  AAN")
-            self.btn_adaptive.setStyleSheet(f"color: {C['green']}; border-color: {C['green']};")
-
-        ts_box.addWidget(self._divider())
-        btn_wfall = QPushButton("Waterfall venster")
+        grp_sys.add(SettingsRow("Baseline", btn_reset, "Herijk de ruisvloer  [R]"))
+        btn_wfall = QPushButton("Openen")
+        btn_wfall.setMinimumHeight(28); btn_wfall.setMinimumWidth(80)
         btn_wfall.clicked.connect(self._open_waterfall)
-        ts_box.addWidget(btn_wfall)
-        self.btn_occ = QPushButton("🛡  Birdie-filter: AAN")
-        self.btn_occ.setMinimumHeight(34)
-        self.btn_occ.setFont(_sys_font(9))
-        self.btn_occ.setStyleSheet(f"color:{C['green']}; border-color:{C['green']};")
-        self.btn_occ.clicked.connect(self._toggle_occupancy)
-        ts_box.addWidget(self.btn_occ)
+        grp_sys.add(SettingsRow("Waterfall venster", btn_wfall))
+        self.sw_debug = ToggleSwitch(det.debug_logging, on_color=C['red'])
+        self.sw_debug.toggled.connect(self._toggle_debug)
+        grp_sys.add(SettingsRow("Debug Log", self.sw_debug,
+                                "Schrijf spectrum-data naar CSV"))
+        ts_box.addWidget(grp_sys)
 
-        self.btn_debug = QPushButton("⏺  Debug Log: UIT")
-        self.btn_debug.setMinimumHeight(34)
-        self.btn_debug.setFont(_sys_font(9))
-        self.btn_debug.setStyleSheet(f"color:{C['gray2']}; border-color:{C['sep']};")
-        self.btn_debug.clicked.connect(self._toggle_debug)
-        ts_box.addWidget(self.btn_debug)
-
-        self.btn_agr = QPushButton("⚡  AGR: AAN")
-        self.btn_agr.setMinimumHeight(34)
-        self.btn_agr.setFont(_sys_font(9))
-        self.btn_agr.setStyleSheet(f"color:{C['green']}; border-color:{C['green']};")
-        self.btn_agr.clicked.connect(self._toggle_agr)
-        ts_box.addWidget(self.btn_agr)
         ts_box.addStretch()
-        hint = QLabel("R=Reset  M=Modus  C=Compact")
+        hint = QLabel("R = Reset    ·    M = Modus    ·    C = Compact")
         hint.setFont(_sys_font(7))
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setStyleSheet(f"color: {C['gray3']};")
@@ -1910,8 +1998,7 @@ class MainWindow(QMainWindow):
             round((m["threshold"] - self.sl_thr._lo) / self.sl_thr._step))
         self.sl_gain.slider.setValue(
             round((m["gain_db"] - self.sl_gain._lo) / self.sl_gain._step))
-        self.btn_auto.setText("Auto Gain  UIT")
-        self.btn_auto.setStyleSheet("")
+        self.sw_auto.setChecked(False)
         col = MODE_COLORS[m["name"]]
         self.btn_mode.setText(m["name"])
         self.btn_mode.setStyleSheet(f"color:{col}; border-color:{col};")
@@ -1921,8 +2008,7 @@ class MainWindow(QMainWindow):
     def _on_gain(self, v):
         self.det.auto_gain = False
         self.det.set_gain(v, auto=False)
-        self.btn_auto.setText("Auto Gain  UIT")
-        self.btn_auto.setStyleSheet("")
+        self.sw_auto.setChecked(False)
 
     def _on_freq(self, v):
         self.det.set_center_freq(v)
@@ -1955,26 +2041,13 @@ class MainWindow(QMainWindow):
         self.det.android_host = text.strip()
         self._settings.setValue("android_host", text.strip())
 
-    def _on_auto(self):
-        self.det.auto_gain = not self.det.auto_gain
+    def _on_auto(self, checked):
+        self.det.auto_gain = bool(checked)
         self.det.set_gain(self.det.gain_db, auto=self.det.auto_gain)
-        if self.det.auto_gain:
-            self.btn_auto.setText("Auto Gain  AAN")
-            self.btn_auto.setStyleSheet(
-                f"color: {C['blue']}; border-color: {C['blue']};")
-        else:
-            self.btn_auto.setText("Auto Gain  UIT")
-            self.btn_auto.setStyleSheet("")
 
-    def _on_adaptive(self):
-        self.det.adaptive_filter = not self.det.adaptive_filter
-        if self.det.adaptive_filter:
-            self.btn_adaptive.setText("🛡  Storingsfilter  AAN")
-            self.btn_adaptive.setStyleSheet(
-                f"color: {C['green']}; border-color: {C['green']};")
-        else:
-            self.btn_adaptive.setText("🛡  Storingsfilter  UIT")
-            self.btn_adaptive.setStyleSheet("")
+    def _on_adaptive(self, checked):
+        self.det.adaptive_filter = bool(checked)
+        if not self.det.adaptive_filter:
             # alles vrijgeven bij uitschakelen
             self.det._suppressed.clear()
             self.det._hot_since.clear()
@@ -2049,24 +2122,13 @@ class MainWindow(QMainWindow):
             self._compact_win.activateWindow()
             self.hide()
 
-    def _toggle_occupancy(self):
-        self.det.occupancy_check = not self.det.occupancy_check
-        if self.det.occupancy_check:
-            self.btn_occ.setText("🛡  Birdie-filter: AAN")
-            self.btn_occ.setStyleSheet(f"color:{C['green']}; border-color:{C['green']};")
-        else:
-            self.btn_occ.setText("🛡  Birdie-filter: UIT")
-            self.btn_occ.setStyleSheet(f"color:{C['gray2']}; border-color:{C['sep']};")
+    def _toggle_occupancy(self, checked):
+        self.det.occupancy_check = bool(checked)
 
-    def _toggle_agr(self):
-        self.det.agr_enabled = not self.det.agr_enabled
-        if self.det.agr_enabled:
-            self.btn_agr.setText("⚡  AGR: AAN")
-            self.btn_agr.setStyleSheet(f"color:{C['green']}; border-color:{C['green']};")
-        else:
+    def _toggle_agr(self, checked):
+        self.det.agr_enabled = bool(checked)
+        if not self.det.agr_enabled:
             self.det.agr_active = False
-            self.btn_agr.setText("⚡  AGR: UIT")
-            self.btn_agr.setStyleSheet(f"color:{C['gray2']}; border-color:{C['sep']};")
 
     def _open_bars_fullscreen(self):
         if not hasattr(self, '_bars_fs_win') or self._bars_fs_win is None:
@@ -2076,14 +2138,8 @@ class MainWindow(QMainWindow):
         else:
             self._bars_fs_win.showFullScreen()
 
-    def _toggle_debug(self):
-        self.det.debug_logging = not self.det.debug_logging
-        if self.det.debug_logging:
-            self.btn_debug.setText("⏺  Debug Log: AAN")
-            self.btn_debug.setStyleSheet(f"color:{C['red']}; border-color:{C['red']};")
-        else:
-            self.btn_debug.setText("⏺  Debug Log: UIT")
-            self.btn_debug.setStyleSheet(f"color:{C['gray2']}; border-color:{C['sep']};")
+    def _toggle_debug(self, checked):
+        self.det.debug_logging = bool(checked)
 
     def _open_waterfall(self):
         if self._wfall_win is not None and self._wfall_win.isVisible():
@@ -2135,16 +2191,10 @@ class MainWindow(QMainWindow):
         self.bars2.update_data(slots_snap, self.det.threshold, self.det.slot_floor, trends,
                                hard_threshold=self.det.hard_threshold)
 
-        # AGR badge + live gain
-        if agr_active:
-            self.btn_agr.setText(f"⚡  AGR: AAN  ({gain_now:.0f} dB)")
-            self.btn_agr.setStyleSheet(f"color:{C['orange']}; border-color:{C['orange']};")
-        elif self.det.agr_enabled:
-            self.btn_agr.setText(f"⚡  AGR: AAN  ({gain_now:.0f} dB)")
-            self.btn_agr.setStyleSheet(f"color:{C['green']}; border-color:{C['green']};")
-        else:
-            self.btn_agr.setText(f"⚡  AGR: UIT  ({gain_now:.0f} dB)")
-            self.btn_agr.setStyleSheet(f"color:{C['gray2']}; border-color:{C['sep']};")
+        # AGR actief → switch oranje kleuren als gain is verlaagd
+        if hasattr(self, 'sw_agr'):
+            self.sw_agr._on_color = QColor(C['orange'] if agr_active else C['green'])
+            self.sw_agr.update()
 
         # Fullscreen balkjes updaten
         if hasattr(self, '_bars_fs_win') and self._bars_fs_win and self._bars_fs_win.isVisible():
