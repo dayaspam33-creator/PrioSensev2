@@ -1210,6 +1210,11 @@ class LabeledSlider(QWidget):
         self.val_lbl.setText(self._fmt.format(val))
         self.valueChanged.emit(val)
 
+    def setValue(self, val):
+        """Zet de slider op een waarde (triggert valueChanged)."""
+        val = max(self._lo, min(self._hi, float(val)))
+        self.slider.setValue(round((val - self._lo) / self._step))
+
     def value(self):
         return self._lo + self.slider.value() * self._step
 
@@ -2130,6 +2135,27 @@ class MainWindow(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(500)
+
+        # Snelle timer voor waterfall (vangt korte bursts beter)
+        self._wfall_timer = QTimer(self)
+        self._wfall_timer.timeout.connect(self._tick_waterfall)
+        self._wfall_timer.start(100)
+
+    def _tick_waterfall(self):
+        try:
+            want_wfall = ((self._wfall_win is not None and self._wfall_win.isVisible()) or
+                          self.slot_top.current_name() == "Waterfall")
+            if not want_wfall:
+                return
+            with self.det._lock:
+                wfall_data = self.det.wfall.copy()
+                freqs      = self.det.freqs.copy()
+            if self.slot_top.current_name() == "Waterfall":
+                self.wfall_panel.refresh(wfall_data, freqs)
+            if self._wfall_win is not None and self._wfall_win.isVisible():
+                self._wfall_win.refresh(wfall_data, freqs)
+        except Exception:
+            pass
 
     @staticmethod
     def _divider():
