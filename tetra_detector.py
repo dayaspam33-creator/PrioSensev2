@@ -75,14 +75,13 @@ THRESHOLD_SOFT   = 30
 THRESHOLD_HARD   = 10
 GAIN_DB          = 40
 TCP_HOST         = "127.0.0.1"
-TCP_PORT         = 1234
-DEVICE_IDX       = 0
+TCP_PORT         = 1234   # kan via --port worden overschreven
+DEVICE_IDX       = 0      # kan via --device worden overschreven
+EXTERN_RTLTCP    = False  # via --extern: zelf geen rtl_tcp starten
+TITLE_SUFFIX     = ""     # via --titel: toevoeging aan venstertitel
+SETTINGS_APP     = "PrioSense"  # aparte opslag per instantie mogelijk
+TILE             = None   # via --tile L/M/R: vensterhelft op het scherm
 
-# Verbindingsmodus: "PC" (rtl_tcp.exe poort 1234) of "Android" (marto poort 14423)
-CONNECTION_MODES = {
-    "PC":      1234,
-    "Android": 14423,
-}
 LOG_COOLDOWN     = 10.0
 N_SEGS           = 10
 DB_PER_BLOCK     = 4.5   # voor absolute schaal (niet meer gebruikt in bars)
@@ -110,12 +109,12 @@ else:
 LOG_PATH         = os.path.join(_LOG_DIR, "detections.csv")
 DEBUG_LOG_PATH   = os.path.join(_LOG_DIR, "debug_log.csv")
 
-# Volledig TETRA 25 kHz raster over de uplink band (380–385 MHz).
-# Hierdoor wordt elk mogelijk kanaal gedekt, niet alleen elke 250 kHz.
-TETRA_FREQS = [round(380.0 + i * 0.025, 3) for i in range(int((385.0 - 380.0) / 0.025) + 1)]
+# Volledig TETRA 25 kHz raster over uplink (380-385) én downlink (390-395 MHz).
+# Detectie skipt automatisch kanalen buiten het zichtbare venster.
+TETRA_FREQS = [round(380.0 + i * 0.025, 3) for i in range(int((395.0 - 380.0) / 0.025) + 1)]
 
 # Lichte rasterlijnen voor de spectrumweergave (elke 0.25 MHz, anders te druk).
-DISPLAY_GRID = [round(380.0 + i * 0.25, 2) for i in range(int((385.0 - 380.0) / 0.25) + 1)]
+DISPLAY_GRID = [round(380.0 + i * 0.25, 2) for i in range(int((395.0 - 380.0) / 0.25) + 1)]
 
 def send_cmd(sock, cmd, param):
     sock.sendall(struct.pack(">BI", cmd, param))
@@ -168,6 +167,7 @@ class TcpDetector:
         self.raw_peaks    = {}
         self.debug_logging    = False
         self._last_debug_log  = 0.0
+        self._dbg_peak        = {}    # piek per kanaal sinds laatste debug-schrijf
         # AGR
         self.agr_enabled      = True
         self.agr_active       = False
@@ -179,16 +179,18 @@ class TcpDetector:
         self._ch_above        = set()   # kanalen die nu boven de vloer zitten
         self._burst_times     = {}      # cf → deque met burst-tijdstempels
         self.alarm_activity   = 0       # aantal bursts laatste 10s op alarm-kanaal
-        # Verbindingsmodus
-        self.connection_mode  = "PC"   # "PC" of "Android"
-        self._tcp_port        = TCP_PORT
-        self.android_host     = "192.168.0.144"  # IP van de telefoon
         # Adaptief storingsfilter — onderdrukt kanalen die te lang onafgebroken
         # hoog staan (= storing), past zich aan tijdens het rijden
         self.adaptive_filter      = False
         self._hot_since           = {}    # freq → tijdstip dat kanaal continu hoog werd
         self._suppressed          = set() # freqs die nu als storing onderdrukt worden
         self.interference_secs    = 25.0  # na X sec onafgebroken hoog → storing
+        # Waterfall-kleurschaal bovengrens (lager = zwakke signalen feller)
+        self.wfall_max            = -20.0
+        # Bekende kanalen (vaste politiekanalen) — krijgen ster + aparte kleur
+        self.known_channels       = {382.900}
+        # Breedte (kHz) van het huidige alarm-signaal
+        self.alarm_width          = 0.0
 
     def _calc_freqs(self, center_hz):
         f = np.linspace((center_hz - SAMPLE_RATE/2) / 1e6,
@@ -209,16 +211,15 @@ class TcpDetector:
             pass
 
     def _connect(self):
-        self._tcp_port = CONNECTION_MODES.get(self.connection_mode, TCP_PORT)
-        host = self.android_host if self.connection_mode == "Android" else TCP_HOST
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.settimeout(5)
-        self._sock.connect((host, self._tcp_port))
+        self._sock.connect((TCP_HOST, TCP_PORT))
         self._sock.settimeout(2)
         try: self._sock.recv(12)
         except Exception: pass
         send_cmd(self._sock, 0x01, self.center_freq)
         send_cmd(self._sock, 0x02, SAMPLE_RATE)
+        send_cmd(self._sock, 0x08, 0)   # digitale RTL2832-AGC uit → vast niveau
         send_cmd(self._sock, 0x03, 0 if self.auto_gain else 1)
         if not self.auto_gain:
             send_cmd(self._sock, 0x04, int(self.gain_db * 10))
@@ -250,35 +251,41 @@ class TcpDetector:
         return False
 
     def start(self):
-        port = CONNECTION_MODES.get(self.connection_mode, TCP_PORT)
-        if self.connection_mode == "Android":
-            # Android modus: RTL TCP Android app draait al op de telefoon
-            print(f"Android modus — verbinden op {TCP_HOST}:{port}")
+        # --extern: rtl_tcp draait al (bv. vergelijkingsopstelling), niet zelf starten
+        if EXTERN_RTLTCP:
+            print(f"Extern modus — verbinden met bestaande rtl_tcp op {TCP_HOST}:{TCP_PORT}")
+            try:
+                self._connect()
+            except Exception as e:
+                raise RuntimeError(f"Kan geen verbinding maken op {TCP_HOST}:{TCP_PORT}.\n\n"
+                                   f"Draait rtl_tcp op deze poort?\n\nFout: {e}")
+            self.running = True
+            self._log_session("SESSION_START")
+            threading.Thread(target=self._loop, daemon=True).start()
+            return
+        # rtl_tcp.exe opstarten
+        if sys.platform != "win32":
+            os.system("pkill rtl_tcp 2>/dev/null")
+            time.sleep(0.5)
+        if os.path.exists(RTL_TCP_PATH):
+            print(f"rtl_tcp starten: {RTL_TCP_PATH}")
+            _flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+            self._proc = subprocess.Popen(
+                [RTL_TCP_PATH, "-a", TCP_HOST, "-p", str(TCP_PORT),
+                 "-d", str(DEVICE_IDX), "-f", str(self.center_freq),
+                 "-s", str(SAMPLE_RATE)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=_flags)
+            threading.Thread(target=self._drain, args=(self._proc.stdout,),
+                             daemon=True).start()
+            time.sleep(3.0)
         else:
-            # PC modus: rtl_tcp.exe opstarten
-            if sys.platform != "win32":
-                os.system("pkill rtl_tcp 2>/dev/null")
-                time.sleep(0.5)
-            if os.path.exists(RTL_TCP_PATH):
-                print(f"rtl_tcp starten: {RTL_TCP_PATH}")
-                _flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
-                self._proc = subprocess.Popen(
-                    [RTL_TCP_PATH, "-a", TCP_HOST, "-p", str(port),
-                     "-d", str(DEVICE_IDX), "-f", str(self.center_freq),
-                     "-s", str(SAMPLE_RATE)],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    creationflags=_flags)
-                threading.Thread(target=self._drain, args=(self._proc.stdout,),
-                                 daemon=True).start()
-                time.sleep(3.0)
-            else:
-                print(f"rtl_tcp niet gevonden — probeer {TCP_HOST}:{port}")
+            print(f"rtl_tcp niet gevonden — probeer {TCP_HOST}:{TCP_PORT}")
         try:
             self._connect()
         except Exception as e:
-            raise RuntimeError(f"Kan geen verbinding maken op {TCP_HOST}:{port}.\n\n"
-                               f"Modus: {self.connection_mode}\n\n"
-                               f"{'Controleer of de dongle is aangesloten en rtl_tcp draait.' if self.connection_mode == 'PC' else 'Controleer of RTL TCP Android actief is en op START gedrukt.'}\n\nFout: {e}")
+            raise RuntimeError(f"Kan geen verbinding maken op {TCP_HOST}:{TCP_PORT}.\n\n"
+                               f"Controleer of de dongle is aangesloten en rtl_tcp draait.\n\nFout: {e}")
         self.running = True
         self._log_session("SESSION_START")
         threading.Thread(target=self._loop, daemon=True).start()
@@ -419,17 +426,22 @@ class TcpDetector:
                                     lo = max(0, idx - hw); hi = min(FFT_SIZE, idx + hw + 1)
                                     raw_db = float(np.mean(diff[lo:hi]))
 
-                                    # Bezettingscheck: echt TETRA vult het volle 25 kHz kanaal,
-                                    # een birdie/storing zit in 1-2 bins. Tel hoeveel bins "vol" zijn.
+                                    # Birdie-filter: combineert BREEDTE en VORM om echt
+                                    # TETRA (breed, vlak blok) te scheiden van storing.
                                     if self.occupancy_check and raw_db > self.slot_floor:
+                                        # Breedte: hoeveel bins vullen het kanaal? (birdie = smal)
                                         wlo = max(0, idx - self._ch_bins); whi = min(FFT_SIZE, idx + self._ch_bins)
-                                        seg = diff[wlo:whi]
+                                        seg  = diff[wlo:whi]
                                         peak = float(np.max(seg))
-                                        # bins binnen 6 dB van de piek = "bezet"
                                         filled = int(np.count_nonzero(seg > peak - 6.0))
                                         occupancy = filled / max(1, seg.size)
-                                        if occupancy < 0.30:
-                                            # Te smal → birdie/storing → onderdruk
+                                        # Vorm: vlakke top (blok) vs spitse piek (naald) binnen het
+                                        # kanaal. Lage piek-tot-gemiddelde = blok = echt TETRA.
+                                        clo = max(0, idx - hw); chi = min(FFT_SIZE, idx + hw + 1)
+                                        cseg = diff[clo:chi]
+                                        peakiness = float(np.max(cseg) - np.mean(cseg))
+                                        if occupancy < 0.30 or peakiness > 10.0:
+                                            # Te smal OF te spits → storing → onderdruk
                                             raw_db = min(raw_db, self.slot_floor - 2.0)
 
                                     raw_ch[cf] = raw_db
@@ -546,11 +558,21 @@ class TcpDetector:
                                 self.alarm = False; self.alarm_level = 0
                                 self._last_red_beep = 0.0
 
-                            # Activiteitsniveau op het alarm-kanaal (aantal bursts laatste 10s)
-                            if self.alarm and self.alarm_freq in self._burst_times:
-                                self.alarm_activity = len(self._burst_times[self.alarm_freq])
+                            # Continu activiteitsniveau: meeste bursts op enig kanaal in
+                            # de laatste 10s (altijd zichtbaar, ook zonder alarm)
+                            self.alarm_activity = max(
+                                (len(dq) for dq in self._burst_times.values()), default=0)
+
+                            # Signaalbreedte (kHz) op het alarm-kanaal — tel bins boven 6 dB
+                            if self.alarm and self.freqs[0] <= self.alarm_freq <= self.freqs[-1]:
+                                aidx = int(round((self.alarm_freq - self.freqs[0]) / self._bin_mhz))
+                                wlo = max(0, aidx - self._ch_bins); whi = min(FFT_SIZE, aidx + self._ch_bins)
+                                seg = diff[wlo:whi]
+                                pk = float(np.max(seg)) if seg.size else 0.0
+                                wide_bins = int(np.count_nonzero(seg > pk - 6.0))
+                                self.alarm_width = wide_bins * self._bin_mhz * 1000.0  # kHz
                             else:
-                                self.alarm_activity = 0
+                                self.alarm_width = 0.0
 
                             # Sirene met harde 60s cooldown
                             if self.alarm_level == 2 and not self.muted:
@@ -588,21 +610,29 @@ class TcpDetector:
 
                             self._prev_alarm_level = self.alarm_level
 
-                            # Debug logging (elke 2s als ingeschakeld)
-                            if self.debug_logging and now - self._last_debug_log >= 2.0:
-                                self._last_debug_log = now
-                                try:
-                                    write_header = not os.path.exists(DEBUG_LOG_PATH)
-                                    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-                                        if write_header:
-                                            f.write("timestamp,gain_db,alarm_level,baseline_avg," +
-                                                    ",".join(f"ch_{cf:.3f}" for cf in sorted(raw_ch)) + "\n")
-                                        baseline_avg = float(np.mean(self.baseline)) if self.baseline is not None else 0.0
-                                        ch_vals = ",".join(f"{raw_ch[cf]:.1f}" for cf in sorted(raw_ch))
-                                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                        f.write(f"{ts},{self.gain_db},{self.alarm_level},{baseline_avg:.1f},{ch_vals}\n")
-                                except Exception:
-                                    pass
+                            # Debug logging — piek per kanaal bijhouden (vangt korte bursts)
+                            if self.debug_logging:
+                                for cf, dbv in raw_ch.items():
+                                    if dbv > self._dbg_peak.get(cf, -999.0):
+                                        self._dbg_peak[cf] = dbv
+                                # Elke 2s wegschrijven en pieken resetten
+                                if now - self._last_debug_log >= 2.0:
+                                    self._last_debug_log = now
+                                    try:
+                                        write_header = not os.path.exists(DEBUG_LOG_PATH)
+                                        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                                            if write_header:
+                                                f.write("timestamp,gain_db,alarm_level,baseline_avg,max_piek," +
+                                                        ",".join(f"ch_{cf:.3f}" for cf in sorted(raw_ch)) + "\n")
+                                            baseline_avg = float(np.mean(self.baseline)) if self.baseline is not None else 0.0
+                                            pk = self._dbg_peak
+                                            ch_vals = ",".join(f"{pk.get(cf, 0.0):.1f}" for cf in sorted(raw_ch))
+                                            max_piek = max(pk.values(), default=0.0)
+                                            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                            f.write(f"{ts},{self.gain_db},{self.alarm_level},{baseline_avg:.1f},{max_piek:.1f},{ch_vals}\n")
+                                    except Exception:
+                                        pass
+                                    self._dbg_peak = {}
 
             except socket.timeout:
                 continue
@@ -917,13 +947,15 @@ class AlarmCard(QFrame):
         if n >= 4:   return "▪▪▪  Actief gesprek"
         if n >= 2:   return "▪▪  Activiteit"
         if n >= 1:   return "▪  Kort contact"
-        return ""
+        return "▫  Rustig"
 
-    def _set(self, mode, freq=0.0, db=0.0, activity=0):
+    def _set(self, mode, freq=0.0, db=0.0, activity=0, width=0.0, known=False):
+        star = "★ " if known else ""
+        w_txt = f"  ·  ~{width:.0f} kHz" if width > 0 else ""
         styles = {
-            "idle":   (C['panel'],  "1px solid " + C['sep'],    C['gray3'], C['gray1'], "—",                              C['gray3']),
-            "orange": ("#2a1b00",   "2px solid " + C['orange'], C['orange'], C['white'], f"{freq:.3f} MHz  +{db:.1f} dB", C['orange']),
-            "red":    ("#2d0b0a",   "2px solid " + C['red'],    C['red'],   C['white'], f"{freq:.3f} MHz  +{db:.1f} dB", C['red']),
+            "idle":   (C['panel'],  "1px solid " + C['sep'],    C['gray3'], C['gray1'], "—",                                          C['gray3']),
+            "orange": ("#2a1b00",   "2px solid " + C['orange'], C['orange'], C['white'], f"{star}{freq:.3f} MHz  +{db:.1f} dB{w_txt}", C['orange']),
+            "red":    ("#2d0b0a",   "2px solid " + C['red'],    C['red'],   C['white'], f"{star}{freq:.3f} MHz  +{db:.1f} dB{w_txt}", C['red']),
         }
         bg, border, dot_col, title_col, detail_txt, detail_col = styles[mode]
         self.setStyleSheet(f"""
@@ -937,12 +969,16 @@ class AlarmCard(QFrame):
         self.title.setStyleSheet(f"color: {title_col}; background: transparent;")
         self.detail.setText(detail_txt)
         self.detail.setStyleSheet(f"color: {detail_col}; background: transparent;")
-        self.activity.setText(self._activity_text(activity) if mode != "idle" else "")
+        # Burst-teller altijd zichtbaar (+ bekend-kanaal markering indien van toepassing)
+        act_txt = self._activity_text(activity)
+        if mode != "idle" and known:
+            act_txt += "   ·   ★ Bekend kanaal"
+        self.activity.setText(act_txt)
         self.activity.setStyleSheet(f"color: {detail_col}; background: transparent;")
 
-    def set_idle(self):                       self._set("idle")
-    def set_orange(self, f, db, activity=0):  self._set("orange", f, db, activity)
-    def set_red(self, f, db, activity=0):     self._set("red",    f, db, activity)
+    def set_idle(self, activity=0):                                 self._set("idle", activity=activity)
+    def set_orange(self, f, db, activity=0, width=0.0, known=False): self._set("orange", f, db, activity, width, known)
+    def set_red(self, f, db, activity=0, width=0.0, known=False):    self._set("red",    f, db, activity, width, known)
 
 
 # ── LabeledSlider ─────────────────────────────────────────────────────────────
@@ -1112,10 +1148,13 @@ class SettingsGroup(QWidget):
 
 # ── WaterfallWindow ───────────────────────────────────────────────────────────
 class WaterfallWindow(QMainWindow):
+    LONG_ROWS = 300    # aantal rijen geschiedenis
+    DECIM     = 5      # refreshes (à 100ms) per rij → 0.5s/rij → 300*0.5 = 2,5 min
+
     def __init__(self, det, parent=None):
         super().__init__(parent)
         self.det = det
-        self.setWindowTitle("PrioSense — Waterfall")
+        self.setWindowTitle("PrioSense — Waterfall (lange geschiedenis)")
         self.setMinimumSize(820, 360)
         self.setStyleSheet(f"background-color: {C['bg']};")
 
@@ -1127,31 +1166,32 @@ class WaterfallWindow(QMainWindow):
         self.pw = pg.PlotWidget()
         self.pw.setBackground(C['panel'])
         self.pw.setLabel('bottom', 'MHz')
-        self.pw.setLabel('left', 'Tijd (frames)')
+        self.pw.setLabel('left', 'Tijd (minuten geleden)')
         self.pw.getAxis('left').setTextPen(QColor(C['gray2']))
         self.pw.getAxis('bottom').setTextPen(QColor(C['gray2']))
         lay.addWidget(self.pw)
 
         with det._lock:
-            data  = det.wfall.copy()
             freqs = det.freqs.copy()
+
+        # Eigen lange buffer met peak-hold
+        self._long  = np.full((self.LONG_ROWS, FFT_SIZE), -80.0)
+        self._acc   = None
+        self._cnt   = 0
+        self._freqs = freqs
 
         self.img = pg.ImageItem()
         self.pw.addItem(self.img)
-
         cmap = pg.colormap.get('inferno')
         self.img.setColorMap(cmap)
-        self.img.setLevels((-80, -20))
-        self._apply_transform(freqs, data.shape)
-        self.img.setImage(data.T)
+        self.img.setLevels((-80, det.wfall_max))
+        self._apply_transform(freqs, self._long.shape)
+        self.img.setImage(self._long.T, autoLevels=False)
         self.pw.setXRange(freqs[0], freqs[-1])
-        self.pw.setYRange(0, WFALL_ROWS)
-
-        try:
-            bar = pg.ColorBarItem(values=(-80, -20), colorMap=cmap, label='dBm')
-            bar.setImageItem(self.img, insert_in=self.pw)
-        except Exception:
-            pass
+        # Y-as in minuten (0 = nu, bovenkant = LONG_ROWS*DECIM*0.1s geleden)
+        secs = self.LONG_ROWS * self.DECIM * 0.1
+        self.pw.getAxis('left').setScale(secs / 60.0 / self.LONG_ROWS)
+        self.pw.setYRange(0, self.LONG_ROWS)
 
     def _apply_transform(self, freqs, shape):
         sx = (freqs[-1] - freqs[0]) / shape[1]
@@ -1161,8 +1201,23 @@ class WaterfallWindow(QMainWindow):
         self.img.setTransform(tr)
 
     def refresh(self, data, freqs):
-        self._apply_transform(freqs, data.shape)
-        self.img.setImage(data.T)
+        # Bij band-wissel: buffer resetten (andere frequentie-indeling)
+        if freqs[0] != self._freqs[0] or freqs[-1] != self._freqs[-1]:
+            self._long[:] = -80.0
+            self._freqs = freqs
+            self._apply_transform(freqs, self._long.shape)
+            self.pw.setXRange(freqs[0], freqs[-1])
+        # Peak-hold over recente frames van de korte buffer
+        cur = np.max(data[:10], axis=0)
+        self._acc = cur if self._acc is None else np.maximum(self._acc, cur)
+        self._cnt += 1
+        if self._cnt >= self.DECIM:
+            self._long = np.roll(self._long, 1, axis=0)
+            self._long[0] = self._acc
+            self._acc = None
+            self._cnt = 0
+            self.img.setLevels((-80, self.det.wfall_max))
+            self.img.setImage(self._long.T, autoLevels=False)
 
 
 # ── DetectionHistoryWidget ────────────────────────────────────────────────────
@@ -1244,6 +1299,22 @@ class WaterfallPanelWidget(QWidget):
         self.img.setImage(data.T, autoLevels=False)
         self._apply_transform(freqs, data.shape)
 
+        # Markers die actieve kanalen omvatten — 2 lijnen per slot (zijkanten),
+        # max 3 slots. Per slot: (linkerlijn met label, rechterlijn).
+        self._markers = []
+        for s in range(3):
+            _dash = pg.mkPen(color='#b0b0b0', width=2, style=Qt.PenStyle.DashLine)
+            left = pg.InfiniteLine(angle=90, movable=False, pen=_dash,
+                                   label="", labelOpts={'position': 0.04,
+                                                        'color': '#b0b0b0',
+                                                        'fill': (0, 0, 0, 120)})
+            right = pg.InfiniteLine(angle=90, movable=False,
+                                    pen=pg.mkPen(color='#b0b0b0', width=2,
+                                                 style=Qt.PenStyle.DashLine))
+            left.setVisible(False); right.setVisible(False)
+            self.pw.addItem(left); self.pw.addItem(right)
+            self._markers.append((left, right))
+
     def _apply_transform(self, freqs, shape):
         tr = QTransform()
         tr.translate(freqs[0], 0)
@@ -1252,8 +1323,36 @@ class WaterfallPanelWidget(QWidget):
         self.pw.setXRange(freqs[0], freqs[-1])
 
     def refresh(self, data, freqs):
+        self.img.setLevels((-80, self.det.wfall_max))
         self.img.setImage(data.T, autoLevels=False)
         self._apply_transform(freqs, data.shape)
+        self._update_markers(freqs)
+
+    def _update_markers(self, freqs):
+        # Lees actieve slots en zet 2 lijnen om elk signaal (kanaalranden ±12.5 kHz)
+        HALF = 0.0125   # MHz — halve TETRA-kanaalbreedte (25 kHz)
+        with self.det._lock:
+            slots = [(s.get("freq"), s.get("db", 0.0)) for s in self.det.slots]
+            thr   = self.det.threshold
+            hard  = self.det.hard_threshold
+            known = set(self.det.known_channels)
+        for i, (left, right) in enumerate(self._markers):
+            freq, db = slots[i] if i < len(slots) else (None, 0.0)
+            if freq is None or not (freqs[0] <= freq <= freqs[-1]):
+                left.setVisible(False); right.setVisible(False)
+                continue
+            is_known = round(freq, 3) in known
+            if   is_known:   col = '#5ac8fa'   # bekend kanaal → lichtblauw
+            elif db >= hard: col = '#ff453a'   # rood
+            elif db >  thr:  col = '#ffd60a'   # geel
+            else:            col = '#b0b0b0'   # lichtgrijs
+            pen = pg.mkPen(color=col, width=2, style=Qt.PenStyle.DashLine)
+            left.setPen(pen);  right.setPen(pen)
+            left.label.setFormat((("★ " if is_known else "") + f"{freq:.3f}"))
+            left.label.setColor(col)
+            left.setPos(freq - HALF)
+            right.setPos(freq + HALF)
+            left.setVisible(True); right.setVisible(True)
 
 
 # ── PanelSlot ─────────────────────────────────────────────────────────────────
@@ -1515,8 +1614,8 @@ class MainWindow(QMainWindow):
         self._test_ticks     = 0
         self._test_data      = {"peaks": [], "channels": set(), "baselines": []}
 
-        # Instellingen laden
-        self._settings = QSettings("PrioSense", "PrioSense")
+        # Instellingen laden (aparte opslag per instantie bij vergelijking)
+        self._settings = QSettings("PrioSense", SETTINGS_APP)
         def _load(key, default, cast=float, lo=None, hi=None):
             try:
                 v = cast(self._settings.value(key, default))
@@ -1527,13 +1626,17 @@ class MainWindow(QMainWindow):
                 return cast(default)
         det.threshold      = _load("threshold",      det.threshold,      lo=5,   hi=50)
         det.gain_db        = _load("gain_db",        det.gain_db,        lo=0,   hi=49)
-        det.center_freq    = _load("center_freq",    det.center_freq,    cast=int, lo=375_000_000, hi=390_000_000)
+        det.center_freq    = _load("center_freq",    det.center_freq,    cast=int, lo=375_000_000, hi=397_000_000)
         det.slot_floor     = _load("slot_floor",     det.slot_floor,     lo=0,   hi=40)
         det.hang_time      = _load("hang_time",      det.hang_time,      lo=0.5, hi=10)
         det.hard_threshold = _load("hard_threshold", det.hard_threshold, lo=10,  hi=60)
+        det.wfall_max      = _load("wfall_max",      det.wfall_max,      lo=-50, hi=-10)
         det.auto_gain      = self._settings.value("auto_gain", "false") == "true"
         det.muted          = self._settings.value("muted",     "false") == "true"
         det.adaptive_filter = self._settings.value("adaptive_filter", "false") == "true"
+        det.occupancy_check = self._settings.value("occupancy_check", "true")  == "true"
+        det.agr_enabled     = self._settings.value("agr_enabled",     "true")  == "true"
+        det.debug_logging   = self._settings.value("debug_logging",   "false") == "true"
         saved_mode         = _load("mode_idx", 1, cast=int, lo=0, hi=len(MODES)-1)
         # Custom modus waarden laden
         MODES[1]["slot_floor"]     = _load("custom_floor", MODES[1]["slot_floor"],     lo=0,   hi=40)
@@ -1541,8 +1644,12 @@ class MainWindow(QMainWindow):
         MODES[1]["hard_threshold"] = _load("custom_hard",  MODES[1]["hard_threshold"], lo=10,  hi=60)
         MODES[1]["hang_time"]      = _load("custom_hang",  MODES[1]["hang_time"],      lo=0.5, hi=10)
 
-        self.setWindowTitle("PrioSense")
-        self.setMinimumSize(1100, 680)
+        self.setWindowTitle("PrioSense" + TITLE_SUFFIX)
+        # In vergelijkingsmodus kleiner minimum zodat 2 vensters naast elkaar passen
+        if TITLE_SUFFIX:
+            self.setMinimumSize(680, 620)
+        else:
+            self.setMinimumSize(1100, 680)
         self.setStyleSheet(QSS)
 
         self._compact_win = CompactWindow(det, parent=self)
@@ -1594,14 +1701,16 @@ class MainWindow(QMainWindow):
         l_box.setContentsMargins(0, 0, 0, 0)
         l_box.setSpacing(6)
 
+        _top_idx = _load("slot_top_idx", 0, cast=int, lo=0, hi=2)
+        _bot_idx = _load("slot_bot_idx", 0, cast=int, lo=0, hi=2)
         self.slot_top = PanelSlot(
             names   = ["Spectrum", "Waterfall", "Signaalbalken"],
             widgets = [self.spec, self.wfall_panel, self.bars],
-            initial_idx=0)
+            initial_idx=_top_idx)
         self.slot_bot = PanelSlot(
             names   = ["Signaalbalken", "Spectrum", "Waterfall"],
             widgets = [self.bars2, self.spec2, self.wfall_panel2],
-            initial_idx=0)
+            initial_idx=_bot_idx)
 
         l_box.addWidget(self.slot_top, stretch=2)
         l_box.addWidget(self.slot_bot, stretch=3)
@@ -1735,56 +1844,49 @@ class MainWindow(QMainWindow):
         self.sw_auto.toggled.connect(self._on_auto)
         grp_recv.add(SettingsRow("Auto Gain", self.sw_auto, "Dongle regelt versterking zelf"))
 
-        self.sl_freq = LabeledSlider("Center MHz", 379.0, 386.0, det.center_freq / 1e6,
+        self.sl_freq = LabeledSlider("Center MHz", 379.0, 396.0, det.center_freq / 1e6,
             step=0.05, fmt="{:.2f}", color=C['orange'])
         self.sl_freq.valueChanged.connect(self._on_freq)
         grp_recv.add(_slider_row(self.sl_freq))
 
         band_presets = [
-            ("Volledig (382.0)",  382.0),
-            ("Laag   380–382",    381.0),
-            ("Midden 381–383",    382.0),
-            ("Hoog   382–384",    383.0),
-            ("Top    383–385",    384.0),
+            ("UL midden 382.5",  382.5),
+            ("UL laag 381",      381.0),
+            ("UL hoog 384",      384.0),
+            ("DL mast 392.5",    392.5),
+            ("DL laag 391",      391.0),
+            ("DL hoog 394",      394.0),
         ]
         self._band_combo = QComboBox()
         self._band_combo.setFixedHeight(28)
-        self._band_combo.setMinimumWidth(150)
+        self._band_combo.setFixedWidth(130)
         self._band_combo.setFont(_sys_font(8))
         self._band_combo.setStyleSheet(_combo_qss)
         for label, _ in band_presets:
             self._band_combo.addItem(label)
         self._band_freqs = [mhz for _, mhz in band_presets]
         self._band_combo.currentIndexChanged.connect(self._on_band_select)
-        grp_recv.add(SettingsRow("Bandvenster", self._band_combo))
+        grp_recv.add(SettingsRow("Bandvenster", self._band_combo, "UL=voertuigen, DL=masten"))
 
-        self._conn_combo = QComboBox()
-        self._conn_combo.setFixedHeight(28)
-        self._conn_combo.setMinimumWidth(150)
-        self._conn_combo.setFont(_sys_font(9))
-        self._conn_combo.setStyleSheet(_combo_qss)
-        for mode_name in CONNECTION_MODES:
-            self._conn_combo.addItem(mode_name)
-        saved_conn = self._settings.value("connection_mode", "PC")
-        if saved_conn in CONNECTION_MODES:
-            self._conn_combo.setCurrentText(saved_conn)
-            det.connection_mode = saved_conn
-        self._conn_combo.currentTextChanged.connect(self._on_conn_mode)
-        grp_recv.add(SettingsRow("Verbinding", self._conn_combo, "PC of telefoon"))
+        # Waterfall-helderheid (bovengrens kleurschaal; lager = zwak feller)
+        self.sl_wfall = LabeledSlider("Waterfall helderheid", -50, -10, det.wfall_max,
+            step=1.0, fmt="{:.0f}", color=C['blue'])
+        self.sl_wfall.valueChanged.connect(lambda v: setattr(self.det, 'wfall_max', float(v)))
+        grp_recv.add(_slider_row(self.sl_wfall))
 
-        self._ip_edit = QLineEdit(self._settings.value("android_host", "192.168.0.144"))
-        self._ip_edit.setFixedHeight(28)
-        self._ip_edit.setMinimumWidth(150)
-        self._ip_edit.setFont(_sys_font(9))
-        self._ip_edit.setPlaceholderText("bijv. 192.168.0.144")
-        self._ip_edit.setStyleSheet(
-            f"QLineEdit {{ background:{C['panel2']}; color:{C['blue']};"
-            f" border:1px solid {C['blue']}; border-radius:6px; padding:2px 8px; }}")
-        self._ip_edit.textChanged.connect(self._on_android_ip)
-        self._ip_row = SettingsRow("Telefoon IP", self._ip_edit)
-        grp_recv.add(self._ip_row)
-        self._ip_row.setVisible(det.connection_mode == "Android")
-        det.android_host = self._settings.value("android_host", "192.168.0.144")
+        # Bekende kanalen (vaste politiekanalen) — komma-gescheiden MHz
+        self._known_edit = QLineEdit(self._settings.value(
+            "known_channels", "382.900"))
+        self._known_edit.setFixedHeight(28)
+        self._known_edit.setFixedWidth(130)
+        self._known_edit.setFont(_sys_font(9))
+        self._known_edit.setPlaceholderText("382.900")
+        self._known_edit.setStyleSheet(
+            f"QLineEdit {{ background:{C['panel2']}; color:#5ac8fa;"
+            f" border:1px solid #5ac8fa; border-radius:6px; padding:2px 8px; }}")
+        self._known_edit.textChanged.connect(self._on_known_channels)
+        self._on_known_channels(self._known_edit.text())
+        grp_recv.add(SettingsRow("Bekende kanalen", self._known_edit, "★ gemarkeerd"))
         ts_box.addWidget(grp_recv)
 
         # ═══ FILTERS ════════════════════════════════════════════════════════
@@ -1831,6 +1933,7 @@ class MainWindow(QMainWindow):
         set_scroll.setWidgetResizable(True)
         set_scroll.setFrameShape(QFrame.Shape.NoFrame)
         set_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        set_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         set_scroll.setWidget(tab_set)
         self._tabs.addTab(set_scroll, "Instellingen")
 
@@ -1877,6 +1980,16 @@ class MainWindow(QMainWindow):
         self._wfall_timer = QTimer(self)
         self._wfall_timer.timeout.connect(self._tick_waterfall)
         self._wfall_timer.start(100)
+
+        # Opgeslagen UI-staat herstellen: actief tabblad en venstergrootte/positie
+        try:
+            self._tabs.setCurrentIndex(int(self._settings.value("tab_idx", 0)))
+        except Exception:
+            pass
+        _geo = self._settings.value("geometry")
+        if _geo is not None:
+            try: self.restoreGeometry(_geo)
+            except Exception: pass
 
     def _make_spectrum(self, det):
         """Bouwt een spectrum-plot en geeft (widget, curve_pwr, curve_base) terug."""
@@ -2012,34 +2125,31 @@ class MainWindow(QMainWindow):
 
     def _on_freq(self, v):
         self.det.set_center_freq(v)
-        new_f = self.det._calc_freqs(int(round(v * 1e6)))
+        new_f = self.det.freqs
+        # Beide spectrum-panelen meeschuiven
         self.curve_pwr.setData(new_f, self.det.power)
         self.curve_base.setData(new_f, self.det.power)
         self.spec.setXRange(new_f[0], new_f[-1])
+        self.curve_pwr2.setData(new_f, self.det.power)
+        self.curve_base2.setData(new_f, self.det.power)
+        self.spec2.setXRange(new_f[0], new_f[-1])
 
     def _on_band_select(self, idx):
         mhz = self._band_freqs[idx]
         self.sl_freq.setValue(mhz)
 
-    def _on_conn_mode(self, mode_name):
-        self.det.connection_mode = mode_name
-        self._settings.setValue("connection_mode", mode_name)
-        self._ip_row.setVisible(mode_name == "Android")
-        color = C['blue'] if mode_name == "Android" else C['green']
-        self._conn_combo.setStyleSheet(f"""
-            QComboBox {{
-                background:{C['panel2']}; color:{color};
-                border:1px solid {color}; border-radius:5px; padding:0 8px;
-            }}
-            QComboBox QAbstractItemView {{
-                background:{C['panel2']}; color:{C['white']};
-                selection-background-color:{C['panel']};
-            }}
-        """)
-
-    def _on_android_ip(self, text):
-        self.det.android_host = text.strip()
-        self._settings.setValue("android_host", text.strip())
+    def _on_known_channels(self, text):
+        freqs = set()
+        for part in text.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                freqs.add(round(float(part), 3))
+            except ValueError:
+                pass
+        self.det.known_channels = freqs
+        self._settings.setValue("known_channels", text)
 
     def _on_auto(self, checked):
         self.det.auto_gain = bool(checked)
@@ -2167,6 +2277,8 @@ class MainWindow(QMainWindow):
             agr_active = self.det.agr_active
             gain_now   = self.det.gain_db
             activity   = self.det.alarm_activity
+            width      = self.det.alarm_width
+            known      = round(afrq, 3) in self.det.known_channels
 
         # (Spectrum en waterfall worden in de snelle 100ms timer bijgewerkt)
 
@@ -2203,12 +2315,12 @@ class MainWindow(QMainWindow):
                                                hard_threshold=self.det.hard_threshold)
 
         if not alarm:
-            self.alarm_card.set_idle()
-            self._compact_win.alarm_card.set_idle()
+            self.alarm_card.set_idle(activity)
+            self._compact_win.alarm_card.set_idle(activity)
             self._hulp_alert.hide_alert()
         elif alvl == 2:
-            self.alarm_card.set_red(afrq, adb, activity)
-            self._compact_win.alarm_card.set_red(afrq, adb, activity)
+            self.alarm_card.set_red(afrq, adb, activity, width, known)
+            self._compact_win.alarm_card.set_red(afrq, adb, activity, width, known)
             if not self._hulp_alert.isVisible():
                 self._hulp_alert.show_alert(afrq, adb)
                 # Windows toast als geminimaliseerd
@@ -2217,8 +2329,8 @@ class MainWindow(QMainWindow):
             else:
                 self._hulp_alert.update_alert(afrq, adb)
         else:
-            self.alarm_card.set_orange(afrq, adb, activity)
-            self._compact_win.alarm_card.set_orange(afrq, adb, activity)
+            self.alarm_card.set_orange(afrq, adb, activity, width, known)
+            self._compact_win.alarm_card.set_orange(afrq, adb, activity, width, known)
             self._hulp_alert.hide_alert()
 
         # Detectie geschiedenis bijwerken bij nieuwe alarm
@@ -2302,8 +2414,15 @@ class MainWindow(QMainWindow):
         self._settings.setValue("custom_thr",     MODES[1]["threshold"])
         self._settings.setValue("custom_hard",    MODES[1]["hard_threshold"])
         self._settings.setValue("custom_hang",    MODES[1]["hang_time"])
-        self._settings.setValue("connection_mode", self.det.connection_mode)
-        self._settings.setValue("android_host",    self.det.android_host)
+        # UI-staat onthouden
+        self._settings.setValue("occupancy_check", str(self.det.occupancy_check).lower())
+        self._settings.setValue("agr_enabled",     str(self.det.agr_enabled).lower())
+        self._settings.setValue("debug_logging",   str(self.det.debug_logging).lower())
+        self._settings.setValue("wfall_max",       self.det.wfall_max)
+        self._settings.setValue("slot_top_idx",    self.slot_top._idx)
+        self._settings.setValue("slot_bot_idx",    self.slot_bot._idx)
+        self._settings.setValue("tab_idx",         self._tabs.currentIndex())
+        self._settings.setValue("geometry",        self.saveGeometry())
         self._timer.stop()
         self.det.stop()
         if self._wfall_win:
@@ -2419,6 +2538,30 @@ def _make_icon():
 
 # ── Opstarten ─────────────────────────────────────────────────────────────────
 def run():
+    # Opstartargumenten verwerken (voor vergelijkingsopstelling met 2 instanties)
+    global TCP_PORT, DEVICE_IDX, EXTERN_RTLTCP, TITLE_SUFFIX, SETTINGS_APP, TILE
+    global LOG_PATH, DEBUG_LOG_PATH
+    argv = sys.argv
+    for i, a in enumerate(argv):
+        if a == "--port" and i+1 < len(argv):
+            try: TCP_PORT = int(argv[i+1])
+            except ValueError: pass
+        elif a == "--device" and i+1 < len(argv):
+            try: DEVICE_IDX = int(argv[i+1])
+            except ValueError: pass
+        elif a == "--extern":
+            EXTERN_RTLTCP = True
+        elif a == "--tile" and i+1 < len(argv):
+            TILE = argv[i+1].upper()
+        elif a == "--titel" and i+1 < len(argv):
+            label = argv[i+1]
+            TITLE_SUFFIX = " — " + label
+            SETTINGS_APP = "PrioSense_" + label.replace(" ", "")
+            # Aparte logbestanden per instantie zodat ze elkaar niet overschrijven
+            safe = "".join(c for c in label if c.isalnum() or c in "+-_")
+            LOG_PATH       = os.path.join(_LOG_DIR, f"detections_{safe}.csv")
+            DEBUG_LOG_PATH = os.path.join(_LOG_DIR, f"debug_log_{safe}.csv")
+
     # PyInstaller splash sluiten zodra Python geladen is
     try:
         import pyi_splash
@@ -2451,6 +2594,18 @@ def run():
     win = MainWindow(det)
     win.setWindowIcon(icon)
     win.show()
+
+    # Vensterhelft op het scherm zetten (vergelijkingsmodus)
+    if TILE:
+        scr = app.primaryScreen().availableGeometry()
+        if TILE in ("L", "R"):
+            w = scr.width() // 2
+            x = scr.x() + (0 if TILE == "L" else w)
+            win.setGeometry(x, scr.y(), w, scr.height())
+        elif TILE in ("1", "2", "3"):  # drie kolommen
+            w = scr.width() // 3
+            x = scr.x() + (int(TILE) - 1) * w
+            win.setGeometry(x, scr.y(), w, scr.height())
 
     # Windows taakbalk icoon via ExtractIconW direct uit de exe
     if sys.platform == "win32":
