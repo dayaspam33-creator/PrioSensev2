@@ -69,8 +69,16 @@ except ImportError:
 # ── Instellingen ──────────────────────────────────────────────────────────────
 DEFAULT_CENTER   = 382_500_000
 SAMPLE_RATE      = 3_200_000
-FFT_SIZE         = 1024
+FFT_SIZE         = 4096        # 0.78 kHz/bin — fijne resolutie + ~6 dB processing gain
 WFALL_ROWS       = 100
+# Detectie (overgenomen van tetra-monitor): per kanaal energie-integratie over
+# 25 kHz + CFAR (lokale ruis uit buurkanalen) i.p.v. dB-middeling vs baseline.
+CHANNEL_KHZ      = 25.0        # TETRA-kanaalraster
+CFAR_HALF_CHANS  = 12          # buurkanalen voor lokale ruisschatting (mediaan)
+CHAN_SMOOTH_A    = 0.20        # tijdmiddeling energie per kanaal
+PEAK_TAU         = 0.3         # s — nahang van de detectiepiek (korte bursts)
+DC_NULL_BINS     = 2           # ± bins rond center dempen (DC/LO-lek)
+OCC_PEAK_FRAC    = 0.40        # 1 bin > 40% kanaalenergie = smalle storing (birdie)
 THRESHOLD_SOFT   = 30
 THRESHOLD_HARD   = 10
 GAIN_DB          = 40
@@ -91,6 +99,13 @@ N_SMOOTH         = 15
 DECAY_DB_S       = 9.0
 BASELINE_FREEZE  = 20.0   # vaste freeze-grens, los van drempel
 SLOT_FLOOR       = 20.0   # minimum dB om in balk te tonen, los van drempel
+
+# Wanted-level ("gezocht-niveau", GTA-stijl): heat bouwt op met sterke detecties
+# en koelt af bij rust. 5 sterren = heat 50.
+HEAT_PER_STAR    = 10.0    # heat per ster
+HEAT_MAX         = 52.0    # plafond
+HEAT_GAIN        = 1.2     # heat per dB dat een detectie boven zijn event-piek komt
+HEAT_COOLDOWN    = HEAT_PER_STAR / 30.0   # afkoeling: ~1 ster per 30 s
 
 _SEARCH_PATHS = [
     "/usr/local/bin/rtl_tcp",
@@ -130,10 +145,20 @@ class TcpDetector:
         self.auto_gain     = False
         self.freqs         = self._calc_freqs(DEFAULT_CENTER)
         self.power         = np.full(FFT_SIZE, -80.0)
-        # Hann-window tegen spectrale lekkage → schoner spectrum, minder valse detecties
-        self._window       = np.hanning(FFT_SIZE).astype(np.float32)
+        # Blackman-window: betere zijlob-onderdrukking dan Hann → minder lekkage
+        self._window       = np.blackman(FFT_SIZE).astype(np.float32)
         self._win_norm     = float(np.sum(self._window))
         self.baseline      = None
+        # CFAR-detectie state (energie per kanaal)
+        self._dc_bin       = FFT_SIZE // 2
+        self.ch_avg        = None    # tijdgemiddelde energie per kanaal
+        self.ch_peak       = None    # piek-hold energie per kanaal
+        self.noise_floor   = -80.0   # weergavelijn (percentiel spectrum)
+        self._last_frame_t = None
+        self._chan_active  = {}      # cf → tijdstip continu actief (blacklist)
+        self._chan_quiet   = {}      # cf → tijdstip stil
+        self._chan_black   = set()   # geblacklistte kanalen (constante storing)
+        self.clip_peak     = 0.0     # ruwe IQ-piek (1.0 = clipping)
         self.wfall         = np.full((WFALL_ROWS, FFT_SIZE), -80.0)
         self.threshold        = float(THRESHOLD_SOFT)
         self.hard_threshold   = 40.0
@@ -162,6 +187,13 @@ class TcpDetector:
             {"freq": None, "db": 0.0, "hang_until": 0.0, "decay_t": 0.0}
             for _ in range(3)
         ]
+        # Live sterkste kanaal (zonder piek-hold) — voor de meter/balk-weergave
+        self.live_db   = 0.0
+        self.live_freq = None
+        # Wanted-level (gezocht-niveau): heat + sterren
+        self.wanted_heat  = 0.0
+        self.wanted_stars = 0
+        self._evt_peak    = None
         self._alarm_cleared_at = 0.0
         self._ch_history  = {}
         self.raw_peaks    = {}
@@ -200,6 +232,25 @@ class TcpDetector:
         # Aantal bins in een 25 kHz TETRA-kanaal (afhankelijk van FFT/sample rate)
         self._ch_bins     = max(2, int(round(0.025 / self._bin_mhz)))
         self._ch_halfbins = max(1, self._ch_bins // 2)
+        # Kanaal-index map opbouwen: per 25 kHz-kanaal de bin-indices (voor
+        # energie-integratie). Eén keer per afstemming berekend.
+        step = CHANNEL_KHZ / 1000.0; half = step / 2.0
+        start = math.ceil(f[0] / step) * step
+        self._chan_idx = []
+        for cf in np.arange(start, f[-1], step):
+            idx = np.where((f >= cf - half) & (f < cf + half))[0]
+            if idx.size:
+                self._chan_idx.append((round(float(cf), 3), idx))
+        # Vlakke index + segment-offsets voor snelle energie (np.add.reduceat
+        # i.p.v. een Python-lus per kanaal → veel sneller, élk frame haalbaar).
+        flat, segs, off = [], [], 0
+        for _, idx in self._chan_idx:
+            segs.append(off); flat.append(idx); off += len(idx)
+        self._chan_flat = np.concatenate(flat) if flat else np.array([], dtype=int)
+        self._chan_segs = np.array(segs, dtype=int) if segs else np.array([0])
+        self._chan_freqs = [cf for cf, _ in self._chan_idx]
+        # energie-buffers resetten (andere indeling)
+        self.ch_avg = None; self.ch_peak = None
         return f
 
     def _drain(self, pipe):
@@ -380,75 +431,71 @@ class TcpDetector:
         buf = bytearray(); needed = FFT_SIZE * 2
         while self.running:
             try:
-                chunk = self._sock.recv(4096)
+                chunk = self._sock.recv(65536)
                 if not chunk:
                     if not self._try_reconnect(): break
                     buf = bytearray(); continue
                 buf.extend(chunk)
                 while len(buf) >= needed:
+                    # Élk frame verwerken (vangt elke korte burst, zoals tetra-monitor)
                     raw     = buf[:needed]; del buf[:needed]
                     iq      = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 127.5) / 127.5
-                    samples = iq[0::2] + 1j * iq[1::2]
-                    # Hann-window toepassen tegen spectrale lekkage
-                    windowed = samples * self._window
-                    fft     = np.fft.fftshift(np.abs(np.fft.fft(windowed, FFT_SIZE)))
-                    power   = 20 * np.log10(fft / self._win_norm + 1e-10)
+                    self.clip_peak = float(np.abs(iq).max())     # 1.0 = tegen clipping
+                    samples = (iq[0::2] + 1j * iq[1::2]) * self._window
+                    fft     = np.fft.fftshift(np.abs(np.fft.fft(samples, FFT_SIZE)))
+                    lin     = (fft / FFT_SIZE) ** 2 + 1e-20       # lineair vermogen per bin
+                    # DC-spike (LO-lek op center) dempen met lokale mediaan
+                    dc = self._dc_bin
+                    ref = np.concatenate([lin[dc-9:dc-3], lin[dc+4:dc+10]])
+                    if ref.size:
+                        lin[dc-DC_NULL_BINS:dc+DC_NULL_BINS+1] = np.median(ref)
+                    power   = 10.0 * np.log10(lin)                # dB (== 20·log10 amplitude)
                     self.n_frames += 1
                     with self._lock:
                         self.wfall    = np.roll(self.wfall, 1, axis=0)
                         self.wfall[0] = power
                         self.power    = power
+                        now      = time.time()
+                        hard_thr = self.hard_threshold
+                        # Energie per kanaal: integratie over 25 kHz (gevectoriseerd)
+                        ch_energy = np.add.reduceat(lin[self._chan_flat], self._chan_segs)
+                        nf_now = float(np.percentile(power, 30))
                         if self.n_frames < self.WARMUP:
-                            alpha = 0.05
-                            if self.baseline is None:
-                                self.baseline = power.copy()
-                            else:
-                                self.baseline = (1 - alpha) * self.baseline + alpha * power
+                            a = 0.1
+                            self.noise_floor = nf_now if self.ch_avg is None else (1-a)*self.noise_floor + a*nf_now
+                            self.ch_avg  = ch_energy if self.ch_avg is None else (1-a)*self.ch_avg + a*ch_energy
+                            self.ch_peak = ch_energy.copy() if self.ch_peak is None else np.maximum(ch_energy, self.ch_peak)
+                            self.baseline = np.full(FFT_SIZE, self.noise_floor, dtype=np.float32)
                             pct = int(100 * self.n_frames / self.WARMUP)
-                            self.status      = f"Baseline opbouwen  {pct}%"
+                            self.status      = f"Ruisvloer meten  {pct}%"
                             self.alarm       = False
                             self.alarm_level = 0
                         else:
                             self.status  = "Scannen"
-                            diff         = power - self.baseline
-                            now          = time.time()
-                            hard_thr     = self.hard_threshold
-                            ch_db    = {}  # smoothed → balkjes & slots
-                            raw_ch   = {}  # ongefilterd → alarm & beep
-                            for cf in TETRA_FREQS:
-                                if self.freqs[0] <= cf <= self.freqs[-1]:
-                                    # Index direct berekenen (freqs is lineair) i.p.v. argmin → veel sneller
-                                    idx = int(round((cf - self.freqs[0]) / self._bin_mhz))
-                                    idx = max(0, min(FFT_SIZE - 1, idx))
-                                    # Gemiddelde over een half kanaal (~12 kHz) rond het centrum → robuust
-                                    # tegen kleine freq-offset, zonder max-bias die valse alarmen geeft
-                                    hw = self._ch_halfbins
-                                    lo = max(0, idx - hw); hi = min(FFT_SIZE, idx + hw + 1)
-                                    raw_db = float(np.mean(diff[lo:hi]))
-
-                                    # Birdie-filter: combineert BREEDTE en VORM om echt
-                                    # TETRA (breed, vlak blok) te scheiden van storing.
-                                    if self.occupancy_check and raw_db > self.slot_floor:
-                                        # Breedte: hoeveel bins vullen het kanaal? (birdie = smal)
-                                        wlo = max(0, idx - self._ch_bins); whi = min(FFT_SIZE, idx + self._ch_bins)
-                                        seg  = diff[wlo:whi]
-                                        peak = float(np.max(seg))
-                                        filled = int(np.count_nonzero(seg > peak - 6.0))
-                                        occupancy = filled / max(1, seg.size)
-                                        # Vorm: vlakke top (blok) vs spitse piek (naald) binnen het
-                                        # kanaal. Lage piek-tot-gemiddelde = blok = echt TETRA.
-                                        clo = max(0, idx - hw); chi = min(FFT_SIZE, idx + hw + 1)
-                                        cseg = diff[clo:chi]
-                                        peakiness = float(np.max(cseg) - np.mean(cseg))
-                                        if occupancy < 0.30 or peakiness > 10.0:
-                                            # Te smal OF te spits → storing → onderdruk
-                                            raw_db = min(raw_db, self.slot_floor - 2.0)
-
-                                    raw_ch[cf] = raw_db
-                                    if cf not in self._ch_history:
-                                        self._ch_history[cf] = deque(maxlen=N_SMOOTH)
-                                    self._ch_history[cf].append(raw_db)
-                                    ch_db[cf] = sum(self._ch_history[cf]) / len(self._ch_history[cf])
+                            self.noise_floor = 0.995*self.noise_floor + 0.005*nf_now
+                            self.baseline = np.full(FFT_SIZE, self.noise_floor, dtype=np.float32)
+                            dt_f = 0.0 if self._last_frame_t is None else min(0.5, now - self._last_frame_t)
+                            self._last_frame_t = now
+                            # Tijdmiddeling + piek-hold per kanaal (vangt korte bursts)
+                            self.ch_avg  = (1-CHAN_SMOOTH_A)*self.ch_avg + CHAN_SMOOTH_A*ch_energy
+                            self.ch_peak = np.maximum(ch_energy, self.ch_peak * math.exp(-dt_f / PEAK_TAU))
+                            # CFAR: lokale ruis = mediaan van naburige kanalen
+                            h = CFAR_HALF_CHANS
+                            padded = np.pad(self.ch_avg, h, mode="edge")
+                            cwin = np.lib.stride_tricks.sliding_window_view(padded, 2*h+1)
+                            local = np.median(cwin, axis=1) + 1e-20
+                            level_avg  = 10.0*np.log10(self.ch_avg / local)
+                            level_peak = 10.0*np.log10(self.ch_peak / local)
+                            levels = np.maximum(level_avg, level_peak)   # dB boven lokale ruis
+                            raw_ch = {}
+                            for ci, (cf, idx) in enumerate(self._chan_idx):
+                                level = float(levels[ci])
+                                # Birdie-check: zit bijna alle energie in 1 bin → smalle storing
+                                if self.occupancy_check and level > self.slot_floor:
+                                    seg = lin[idx]; ssum = float(seg.sum())
+                                    if ssum > 0 and float(seg.max())/ssum > OCC_PEAK_FRAC:
+                                        level = min(level, self.slot_floor - 2.0)
+                                raw_ch[cf] = level
                             # Peak-hold voor raw data venster (elke FFT-frame bijgewerkt)
                             for cf, rdb in raw_ch.items():
                                 pk_db, pk_exp = self.raw_peaks.get(cf, (rdb, now + 3.0))
@@ -470,22 +517,8 @@ class TcpDetector:
                             for cf, dq in self._burst_times.items():
                                 while dq and now - dq[0] > 10.0:
                                     dq.popleft()
-                            # Baseline freeze op basis van smoothed waarden
-                            best_db = max(ch_db.values(), default=0.0)
-                            if self.alarm_level == 0:
-                                if self._alarm_cleared_at == 0.0:
-                                    self._alarm_cleared_at = now
-                                silent_secs = now - self._alarm_cleared_at
-                                if best_db < BASELINE_FREEZE or silent_secs > 10.0:
-                                    # Na 10s rust: iets sneller bijwerken om bevroren baseline te corrigeren,
-                                    # maar mild gehouden (max 0.008) zodat de baseline stabiel/recht blijft
-                                    alpha = 0.003 if silent_secs <= 10.0 else min(0.008, 0.003 + (silent_secs - 10.0) * 0.0003)
-                                    self.baseline = (1 - alpha) * self.baseline + alpha * power
-                            else:
-                                self._alarm_cleared_at = 0.0
-                                if best_db < BASELINE_FREEZE:
-                                    alpha = 0.003
-                                    self.baseline = (1 - alpha) * self.baseline + alpha * power
+                            # (Ruisvloer/baseline wordt nu per frame gezet als CFAR-niveau;
+                            #  geen aparte baseline-freeze meer nodig.)
                             # Balkjes en slots op basis van RUWE waarden
                             active   = {cf: db for cf, db in raw_ch.items() if db > self.slot_floor}
                             assigned = set()
@@ -539,6 +572,11 @@ class TcpDetector:
                             best_raw_db   = max(alarm_ch.values(), default=0.0)
                             best_raw_freq = max(alarm_ch, key=alarm_ch.get) if alarm_ch else 0.0
 
+                            # Live waarden voor de weergave (volgt het signaal direct,
+                            # zonder piek-hold/hang — zodat de meter terugvalt)
+                            self.live_db   = best_raw_db
+                            self.live_freq = best_raw_freq if best_raw_db > self.slot_floor else None
+
                             if best_raw_db > hard_thr:
                                 self.alarm = True; self.alarm_level = 2
                                 self.alarm_freq = best_raw_freq; self.alarm_db = best_raw_db
@@ -552,11 +590,26 @@ class TcpDetector:
                                 self.alarm = True; self.alarm_level = 1
                                 self.alarm_freq = best_raw_freq; self.alarm_db = best_raw_db
                                 self._alarm_until = now + 2.0
-                                if self._prev_alarm_level == 0:
-                                    self._beep()
+                                # (geen piep meer op de drempel — alleen rode sirene)
                             elif now >= self._alarm_until:
                                 self.alarm = False; self.alarm_level = 0
                                 self._last_red_beep = 0.0
+
+                            # Wanted-level: koel continu af; groei met de sterkte van
+                            # detecties (alleen op nieuwe pieken binnen een event, zodat
+                            # een constante bron niet eindeloos opbouwt).
+                            self.wanted_heat = max(0.0, self.wanted_heat - HEAT_COOLDOWN * dt_f)
+                            if self.alarm and self.alarm_level >= 1:
+                                if self._evt_peak is None:
+                                    self._evt_peak = self.threshold
+                                if best_raw_db > self._evt_peak:
+                                    self.wanted_heat = min(
+                                        HEAT_MAX,
+                                        self.wanted_heat + HEAT_GAIN * (best_raw_db - self._evt_peak))
+                                    self._evt_peak = best_raw_db
+                            else:
+                                self._evt_peak = None
+                            self.wanted_stars = min(5, int(self.wanted_heat // HEAT_PER_STAR))
 
                             # Continu activiteitsniveau: meeste bursts op enig kanaal in
                             # de laatste 10s (altijd zichtbaar, ook zonder alarm)
@@ -567,7 +620,7 @@ class TcpDetector:
                             if self.alarm and self.freqs[0] <= self.alarm_freq <= self.freqs[-1]:
                                 aidx = int(round((self.alarm_freq - self.freqs[0]) / self._bin_mhz))
                                 wlo = max(0, aidx - self._ch_bins); whi = min(FFT_SIZE, aidx + self._ch_bins)
-                                seg = diff[wlo:whi]
+                                seg = power[wlo:whi] - self.noise_floor
                                 pk = float(np.max(seg)) if seg.size else 0.0
                                 wide_bins = int(np.count_nonzero(seg > pk - 6.0))
                                 self.alarm_width = wide_bins * self._bin_mhz * 1000.0  # kHz
@@ -651,10 +704,11 @@ from PyQt6.QtWidgets import (
     QProgressBar, QDialog, QTabWidget, QStackedWidget, QComboBox, QLineEdit,
     QScrollArea,
 )
-from PyQt6.QtCore import (Qt, QTimer, QRectF, pyqtSignal, QSettings,
+from PyQt6.QtCore import (Qt, QTimer, QRectF, QPointF, pyqtSignal, QSettings, QSize,
                           QPropertyAnimation, pyqtProperty, QEasingCurve)
 from PyQt6.QtGui import (
     QPainter, QColor, QFont, QPainterPath, QTransform, QIcon, QPixmap, QPen,
+    QBrush, QPolygonF, QRadialGradient,
 )
 import pyqtgraph as pg
 
@@ -678,10 +732,11 @@ C = {
 def _qc(k): return QColor(C[k])
 
 # ── Rijmodi ───────────────────────────────────────────────────────────────────
+# Drempels nu in dB boven de LOKALE (CFAR-)ruis — schaal van tetra-monitor.
 MODES = [
-    {"name": "Stad",     "slot_floor": 22, "threshold": 32, "hard_threshold": 45, "hang_time": 5.0, "gain_db": 30},
-    {"name": "Custom",   "slot_floor": 15, "threshold": 28, "hard_threshold": 40, "hang_time": 4.0, "gain_db": 40},
-    {"name": "Snelweg",  "slot_floor": 10, "threshold": 25, "hard_threshold": 42, "hang_time": 3.0, "gain_db": 40},
+    {"name": "Stad",     "slot_floor": 20, "threshold": 35, "hard_threshold": 45, "hang_time": 5.0, "gain_db": 36},
+    {"name": "Custom",   "slot_floor": 10, "threshold": 18, "hard_threshold": 30, "hang_time": 4.0, "gain_db": 36},
+    {"name": "Snelweg",  "slot_floor":  8, "threshold": 14, "hard_threshold": 26, "hang_time": 3.0, "gain_db": 36},
 ]
 MODE_COLORS = {"Stad": C["orange"], "Custom": C["blue"], "Snelweg": C["green"]}
 
@@ -766,6 +821,64 @@ QFrame#divider {{
 
 
 # ── SignalBarsWidget ──────────────────────────────────────────────────────────
+def _set_target(w, slots, live_db, live_freq):
+    """Lees het live signaal (zonder detector-piekhold, anders sterkste slot)
+    en houd de piek vast gedurende hang_time. De animatie-timer loopt er
+    vloeiend naartoe: snel omhoog, vasthouden, dan rustig terug."""
+    if live_db is not None:
+        live = float(live_db)
+        w._live_freq = live_freq
+    else:
+        dbs = [float(s.get("db", 0.0)) for s in slots] or [0.0]
+        bi  = max(range(len(dbs)), key=lambda i: dbs[i])
+        live = dbs[bi]
+        w._live_freq = slots[bi].get("freq") if slots else None
+    w._live_db = live
+    # Piek vasthouden: nieuwe piek verlengt de hang-tijd
+    if live >= w._hold_db:
+        w._hold_db    = live
+        w._hold_until = time.monotonic() + max(0.0, w._hang_time)
+
+
+def _ease_step(w):
+    """Eén animatiestap richting de effectieve doelwaarde (met hang-hold).
+    Retourneert True als er iets veranderde (dan moet hertekend worden)."""
+    now = time.monotonic()
+    if now < w._hold_until:
+        eff = w._hold_db                 # nog binnen hang_time → vasthouden
+    else:
+        eff = w._live_db                 # hang voorbij → terugvallen
+        w._hold_db = w._live_db
+    w._target_db = eff
+    if eff >= w._disp_db:
+        nd = w._disp_db + 0.35 * (eff - w._disp_db)   # vloeiend omhoog
+        if abs(eff - nd) < 0.05:
+            nd = eff
+    else:
+        # Rustig terug: ~1 seconde per segment (vakje). Stap = dB-breedte van
+        # het huidige vakje gedeeld door ~30 frames/seconde.
+        dec = _seg_db_width(w) / 30.0
+        nd  = max(eff, w._disp_db - dec)
+    changed = abs(nd - w._disp_db) > 0.02
+    w._disp_db = nd
+    return changed
+
+
+def _seg_db_width(w):
+    """dB-breedte van één segment (vakje) op het huidige niveau."""
+    if w._disp_db >= w._hard_threshold:
+        return 5.0
+    if w._disp_db >= w._threshold:
+        return max(1.0, (w._hard_threshold - w._threshold) / 4.0)
+    return max(1.0, (w._threshold - w._slot_floor) / 4.0)
+
+
+def _disp_trend(w):
+    """Richting: doel boven huidige weergave = nadert, eronder = rijdt weg."""
+    d = w._target_db - w._disp_db
+    return 1 if d > 1.0 else (-1 if d < -1.0 else 0)
+
+
 class SignalBarsWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -775,16 +888,62 @@ class SignalBarsWidget(QWidget):
         self._slot_floor     = float(SLOT_FLOOR)
         self._trends         = [0, 0, 0]
         self._known_freqs    = set()
+        self._disp_db        = 0.0
+        self._target_db      = 0.0
+        self._live_db        = 0.0
+        self._live_freq      = None
+        self._hold_db        = 0.0
+        self._hold_until     = 0.0
+        self._hang_time      = float(HANG_TIME)
+        self._peak_db        = 0.0
+        self._peak_freq      = None
+        self._peak_until     = 0.0
+        self._wanted_stars   = 0
         self.setMinimumSize(260, 200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._anim = QTimer(self)
+        self._anim.timeout.connect(self._anim_step)
+        self._anim.start(33)
 
-    def update_data(self, slots, threshold, slot_floor=20.0, trends=None, hard_threshold=None, known_freqs=None):
+    # Hoe lang de dB-piekwaarde in de tekst blijft staan nadat het signaal zakt
+    PEAK_TEXT_HOLD = 12.0
+    # dB per tick (~33 ms) waarmee de piek-tekst terugzakt zodra de hold voorbij is
+    PEAK_DECAY     = 0.2
+
+    def _anim_step(self):
+        changed = _ease_step(self)
+        now = time.monotonic()
+        # Frequentielabel volgt het live-signaal en verdwijnt zodra de balk leeg is.
+        if self._live_freq is not None:
+            self._peak_freq = self._live_freq
+        elif self._disp_db <= self._slot_floor:
+            self._peak_freq = None
+        # Piek-markering (cyan lijn): houdt de recente top kort vast en zakt daarna
+        # terug naar de balk. De dB-tekst zelf volgt de balk (_disp_db) en wordt bij
+        # het tekenen gelezen, zodat getal en balken samen terugzakken.
+        if self._live_freq is not None and self._disp_db > self._peak_db + 0.05:
+            self._peak_db    = self._disp_db
+            self._peak_until = now + self.PEAK_TEXT_HOLD
+            changed = True
+        elif now >= self._peak_until and self._peak_db > self._disp_db:
+            self._peak_db = max(self._disp_db, self._peak_db - self.PEAK_DECAY)
+            changed = True
+        if changed:
+            self.update()
+
+    def update_data(self, slots, threshold, slot_floor=20.0, trends=None,
+                    hard_threshold=None, known_freqs=None, live_db=None,
+                    live_freq=None, hang_time=None, wanted_stars=0):
         self._slots          = [dict(s) for s in slots]
         self._threshold      = float(threshold)
         self._slot_floor     = float(slot_floor)
         self._hard_threshold = float(hard_threshold) if hard_threshold else float(threshold) + 10.0
         self._trends         = trends or [0, 0, 0]
         self._known_freqs    = known_freqs or set()
+        self._wanted_stars   = int(wanted_stars)
+        if hang_time is not None:
+            self._hang_time = float(hang_time)
+        _set_target(self, slots, live_db, live_freq)
         self.update()
 
     def paintEvent(self, _event):
@@ -797,115 +956,597 @@ class SignalBarsWidget(QWidget):
         TITLE_H = 28
         p.setFont(_sys_font(9, bold=True))
         p.setPen(_qc("gray2"))
-        p.drawText(0, 0, W, TITLE_H,
-                   int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+        p.drawText(12, 0, W - 60, TITLE_H,
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                    "SIGNAALSTERKTE")
 
-        LABEL_H  = 62
-        bars_top = TITLE_H + 4
+        # Eén balk: live sterkste signaal, vloeiend gesmoothed
+        db_val = self._disp_db
+
+        LABEL_H  = 66
+        bars_top = TITLE_H + 6
         bars_h   = H - bars_top - LABEL_H
-        seg_gap  = 3
-        pad_x    = 10
+        seg_gap  = 4
+        pad_x    = 14
         pad_y    = 8
 
-        section_w   = W / 3
-        seg_w       = section_w * 0.52
+        seg_w       = min(240.0, W * 0.64)
         seg_h_total = (bars_h - 2 * pad_y - (N_SEGS - 1) * seg_gap) / N_SEGS
         seg_h       = max(4.0, seg_h_total - 1)
 
         green_range  = max(1.0, self._threshold      - self._slot_floor)
         yellow_range = max(1.0, self._hard_threshold - self._threshold)
 
-        for bi in range(3):
-            slot   = self._slots[bi]
-            db_val = float(slot.get("db", 0.0))
-            freq   = slot.get("freq", None)
-            if db_val <= self._slot_floor:
-                n_lit = 0
-            elif db_val < self._threshold:
-                # Groene zone: segs 1-4
-                n_lit = max(1, min(4, int((db_val - self._slot_floor) / green_range * 4) + 1))
-            elif db_val < self._hard_threshold:
-                # Gele zone: segs 5-8
-                n_lit = 4 + max(1, min(4, int((db_val - self._threshold) / yellow_range * 4) + 1))
+        if db_val <= self._slot_floor:
+            n_lit = 0
+        elif db_val < self._threshold:
+            n_lit = max(1, min(4, int((db_val - self._slot_floor) / green_range * 4) + 1))
+        elif db_val < self._hard_threshold:
+            n_lit = 4 + max(1, min(4, int((db_val - self._threshold) / yellow_range * 4) + 1))
+        else:
+            n_lit = min(N_SEGS, 8 + max(1, min(2, int((db_val - self._hard_threshold) / 5) + 1)))
+
+        cx      = W / 2.0
+        seg_x   = cx - seg_w / 2
+        track_x = seg_x - pad_x
+        track_w = seg_w + 2 * pad_x
+
+        track_path = QPainterPath()
+        track_path.addRoundedRect(QRectF(track_x, bars_top, track_w, bars_h), 12, 12)
+        p.fillPath(track_path, _qc("panel2"))
+
+        for vi in range(N_SEGS):
+            li  = N_SEGS - 1 - vi
+            lit = li < n_lit
+            y   = bars_top + pad_y + vi * (seg_h_total + seg_gap)
+
+            seg_rect = QRectF(seg_x, y, seg_w, seg_h)
+            seg_path = QPainterPath()
+            seg_path.addRoundedRect(seg_rect, 4, 4)
+
+            if lit:
+                glow = QColor(_SEG_ON[li])
+                glow.setAlpha(55)
+                glow_path = QPainterPath()
+                glow_path.addRoundedRect(
+                    QRectF(seg_x - 4, y - 1, seg_w + 8, seg_h + 2), 6, 6)
+                p.fillPath(glow_path, glow)
+                p.fillPath(seg_path, _SEG_ON[li])
             else:
-                # Rode zone: segs 9-10
-                n_lit = min(N_SEGS, 8 + max(1, min(2, int((db_val - self._hard_threshold) / 5) + 1)))
+                p.fillPath(seg_path, _SEG_OFF[li])
 
-            cx      = section_w * bi + section_w / 2
-            seg_x   = cx - seg_w / 2
-            track_x = seg_x - pad_x
-            track_w = seg_w + 2 * pad_x
-
-            track_path = QPainterPath()
-            track_path.addRoundedRect(QRectF(track_x, bars_top, track_w, bars_h), 10, 10)
-            p.fillPath(track_path, _qc("panel2"))
-
-            for vi in range(N_SEGS):
-                li  = N_SEGS - 1 - vi
-                lit = li < n_lit
-                y   = bars_top + pad_y + vi * (seg_h_total + seg_gap)
-
-                seg_rect = QRectF(seg_x, y, seg_w, seg_h)
-                seg_path = QPainterPath()
-                seg_path.addRoundedRect(seg_rect, 3, 3)
-
-                if lit:
-                    glow = QColor(_SEG_ON[li])
-                    glow.setAlpha(55)
-                    glow_path = QPainterPath()
-                    glow_path.addRoundedRect(
-                        QRectF(seg_x - 3, y - 1, seg_w + 6, seg_h + 2), 5, 5)
-                    p.fillPath(glow_path, glow)
-                    p.fillPath(seg_path, _SEG_ON[li])
-                else:
-                    p.fillPath(seg_path, _SEG_OFF[li])
-
-            lx = int(track_x - pad_x)
-            lw = int(track_w + 2 * pad_x)
-            ly = H - LABEL_H + 4
-
-            if freq is not None:
-                if db_val >= self._hard_threshold:
-                    fc = _qc("red")
-                elif db_val > self._threshold:
-                    fc = _qc("yellow")
-                else:
-                    fc = _qc("green")
-                p.setFont(_sys_font(8, bold=True))
-                p.setPen(fc)
-                p.drawText(lx, ly, lw, 20,
-                           int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                           f"{freq:.3f} MHz")
-                p.setFont(_sys_font(7))
-                p.setPen(_qc("gray2"))
-                p.drawText(lx, ly + 21, lw, 18,
-                           int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                           f"+{db_val:.0f} dB")
-                # Richting indicator
-                trend = self._trends[bi]
-                if trend == 1:
-                    arrow = "▲ Nadert"
-                    ac    = _qc("green")
-                elif trend == -1:
-                    arrow = "▼ Rijdt weg"
-                    ac    = _qc("orange")
-                else:
-                    arrow = "► Stabiel"
-                    ac    = _qc("gray2")
-                p.setFont(_sys_font(7, bold=True))
-                p.setPen(ac)
-                p.drawText(lx, ly + 39, lw, 16,
-                           int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                           arrow)
+        # dB-tekst volgt de balk (_disp_db): getal en balken zakken samen terug.
+        show_db   = self._disp_db
+        show_freq = self._peak_freq
+        ly = H - LABEL_H + 6
+        if show_freq is not None and show_db > self._slot_floor:
+            if show_db >= self._hard_threshold:
+                fc = _qc("red")
+            elif show_db > self._threshold:
+                fc = _qc("yellow")
             else:
-                p.setFont(_sys_font(11, bold=True))
-                p.setPen(_qc("gray3"))
-                p.drawText(lx, ly, lw, 24,
-                           int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                           "—")
+                fc = _qc("green")
+            star = "★ " if show_freq in self._known_freqs else ""
+            p.setFont(_sys_font(12, bold=True))
+            p.setPen(fc)
+            p.drawText(0, ly, W, 22,
+                       int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                       f"{star}{show_freq:.3f} MHz")
+            p.setFont(_sys_font(9, bold=True))
+            p.setPen(_qc("gray1"))
+            p.drawText(0, ly + 22, W, 18,
+                       int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                       f"+{show_db:.0f} dB")
+            trend = _disp_trend(self)
+            if trend == 1:
+                arrow, ac = "▲ Nadert", _qc("green")
+            elif trend == -1:
+                arrow, ac = "▼ Rijdt weg", _qc("orange")
+            else:
+                arrow, ac = "► Stabiel", _qc("gray2")
+            p.setFont(_sys_font(8, bold=True))
+            p.setPen(ac)
+            p.drawText(0, ly + 40, W, 16,
+                       int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                       arrow)
+        else:
+            p.setFont(_sys_font(11, bold=True))
+            p.setPen(_qc("gray3"))
+            p.drawText(0, ly, W, 24,
+                       int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                       "—")
 
         p.end()
+
+
+def _star_polygon(cx, cy, ro, ri):
+    """Vijfpuntige ster als QPolygonF (punt naar boven)."""
+    pts = []
+    for k in range(10):
+        ang = -math.pi / 2 + k * math.pi / 5
+        r = ro if k % 2 == 0 else ri
+        pts.append(QPointF(cx + r * math.cos(ang), cy + r * math.sin(ang)))
+    return QPolygonF(pts)
+
+
+# ── SignalBarsHWidget (horizontale variant) ───────────────────────────────────
+class SignalBarsHWidget(SignalBarsWidget):
+    """Zijwaartse signaalbalk: dunne slats die naar rechts oplopen, met een
+    piek-markering en dB/freq-uitlezing. Erft alle smoothing/peak-hold-logica;
+    alleen het tekenen verschilt van de verticale balk."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(280, 110)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, _qc("panel"))
+
+        # Compacte gekaderde box, gecentreerd in het paneel
+        card_w = min(float(W - 24), 900.0)
+        card_h = min(float(H - 16), 300.0)
+        card_x = (W - card_w) / 2.0
+        card_y = (H - card_h) / 2.0
+        card_rect = QRectF(card_x, card_y, card_w, card_h)
+        cpath = QPainterPath(); cpath.addRoundedRect(card_rect, 14, 14)
+        p.fillPath(cpath, QColor("#161a20"))
+        p.setPen(QPen(QColor("#2a2f37"), 1)); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(card_rect, 14, 14)
+
+        p.setFont(_sys_font(9, bold=True))
+        p.setPen(_qc("gray2"))
+        p.drawText(int(card_x + 16), int(card_y + 7), int(card_w - 60), 20,
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                   "SIGNAALSTERKTE")
+
+        db     = self._disp_db
+        db_max = self._hard_threshold + 8.0
+        rng    = max(1.0, db_max - self._slot_floor)
+        f      = max(0.0, min(1.0, (db - self._slot_floor) / rng))
+
+        green  = QColor("#2ed158")
+        orange = QColor("#ff9f0a")
+        red    = QColor("#ff3b30")
+
+        def zone_col(val):
+            if val < self._threshold:      return green
+            if val < self._hard_threshold: return orange
+            return red
+
+        # Responsive: smal venster (bv. compact) -> uitlezing ONDER de balk,
+        # balk op volle breedte. Breed -> uitlezing naast de balk.
+        narrow = card_w < 440.0
+        bar_x0 = card_x + 18
+        if narrow:
+            bar_x1 = card_x + card_w - 18
+            bar_h  = 44.0
+            bar_y  = card_y + 30
+        else:
+            readout_w = min(210.0, card_w * 0.34)
+            bar_x1 = card_x + card_w - readout_w - 16
+            bar_h  = 92.0
+            bar_y  = card_y + 38
+        bar_w = max(60.0, bar_x1 - bar_x0)
+
+        # Track-achtergrond
+        track = QPainterPath()
+        track.addRoundedRect(QRectF(bar_x0 - 6, bar_y - 6, bar_w + 12, bar_h + 12), 8, 8)
+        p.fillPath(track, QColor("#10141a"))
+
+        n     = max(8, min(22, int(bar_w / 16)))   # vast aantal: bredere slats bij groter
+        pitch = bar_w / n
+        sw    = max(5.0, pitch * 0.70)
+        n_lit = int(round(f * n))
+        for i in range(n):
+            x   = bar_x0 + i * pitch + (pitch - sw) / 2.0
+            val = self._slot_floor + (i + 0.5) / n * rng
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(x, bar_y, sw, bar_h), 2, 2)
+            if i < n_lit:
+                col  = zone_col(val)
+                glow = QColor(col); glow.setAlpha(55)
+                gpath = QPainterPath()
+                gpath.addRoundedRect(QRectF(x - 2, bar_y - 1, sw + 4, bar_h + 2), 3, 3)
+                p.fillPath(gpath, glow)
+                p.fillPath(path, col)
+            else:
+                p.fillPath(path, QColor("#262c34"))
+
+        # dB-schaal onder de balk
+        lbl_y = int(bar_y + bar_h + (9 if not narrow else 5))
+        p.setFont(_sys_font(7, bold=True)); p.setPen(_qc("gray3"))
+        p.drawText(int(bar_x0), lbl_y, 40, 14,
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                   f"{self._slot_floor:.0f}")
+        p.drawText(int(bar_x1 - 40), lbl_y, 40, 14,
+                   int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                   f"{db_max:.0f}")
+
+        # Piek-markering
+        if self._peak_db > self._slot_floor:
+            fp = max(0.0, min(1.0, (self._peak_db - self._slot_floor) / rng))
+            px = bar_x0 + fp * bar_w
+            p.setPen(QPen(QColor("#9fe8ff"), 2.5))
+            p.drawLine(int(px), int(bar_y - 6), int(px), int(bar_y + bar_h + 6))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#9fe8ff"))
+            p.drawPolygon(QPolygonF([QPointF(px - 5, bar_y - 6),
+                                     QPointF(px + 5, bar_y - 6),
+                                     QPointF(px, bar_y + 1)]))
+
+        # dB-tekst volgt de balk (_disp_db); de cyan piek-markering hierboven
+        # gebruikt nog wel _peak_db. Zo zakken getal en balken samen terug.
+        show_db, show_freq = self._disp_db, self._peak_freq
+        active = show_freq is not None and show_db > self._slot_floor
+        trend = _disp_trend(self)
+        if trend == 1:    tr_txt, ac = "▲ Nadert", _qc("green")
+        elif trend == -1: tr_txt, ac = "▼ Rijdt weg", _qc("orange")
+        else:             tr_txt, ac = "► Stabiel", _qc("gray2")
+
+        if narrow:
+            # Uitlezing gecentreerd onder de balk
+            ry = int(bar_y + bar_h + 20)
+            if active:
+                p.setFont(_sys_font(20, bold=True)); p.setPen(zone_col(show_db))
+                p.drawText(int(card_x), ry, int(card_w), 26,
+                           int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                           f"+{show_db:.0f} dB")
+                star = "★ " if show_freq in self._known_freqs else ""
+                p.setFont(_sys_font(9, bold=True)); p.setPen(_qc("gray1"))
+                p.drawText(int(card_x), ry + 24, int(card_w), 14,
+                           int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                           f"{star}{show_freq:.3f} MHz  ·  {tr_txt}")
+            else:
+                p.setFont(_sys_font(15, bold=True)); p.setPen(_qc("gray3"))
+                p.drawText(int(card_x), ry, int(card_w), 26,
+                           int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter), "—")
+            div_y = ry + 44
+        else:
+            # Uitlezing rechts naast de balk
+            rx  = bar_x1 + 14
+            cyc = bar_y + bar_h / 2.0
+            if active:
+                p.setFont(_sys_font(int(max(20, min(32, bar_h * 0.40))), bold=True)); p.setPen(zone_col(show_db))
+                p.drawText(int(rx), int(cyc - 34), int(readout_w), 42,
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                           f"+{show_db:.0f} dB")
+                star = "★ " if show_freq in self._known_freqs else ""
+                p.setFont(_sys_font(12, bold=True)); p.setPen(_qc("gray1"))
+                p.drawText(int(rx), int(cyc + 10), int(readout_w), 18,
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                           f"{star}{show_freq:.3f} MHz")
+                p.setFont(_sys_font(9, bold=True)); p.setPen(ac)
+                p.drawText(int(rx), int(cyc + 30), int(readout_w), 14,
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                           tr_txt)
+            else:
+                p.setFont(_sys_font(16, bold=True)); p.setPen(_qc("gray3"))
+                p.drawText(int(rx), int(cyc - 12), int(readout_w), 24,
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "—")
+            div_y = bar_y + bar_h + 28
+
+        # ── Heat-Level (5 sterren) ──
+        stars = max(0, min(5, int(self._wanted_stars)))
+        p.setPen(QPen(QColor("#23282f"), 1))
+        p.drawLine(int(card_x + 16), int(div_y), int(card_x + card_w - 16), int(div_y))
+        p.setFont(_sys_font(8, bold=True)); p.setPen(_qc("gray2"))
+        p.drawText(int(card_x + 18), int(div_y + 16), 200, 14,
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "HEAT-LEVEL")
+        lit_col = (QColor("#ffd60a") if stars <= 3
+                   else QColor("#ff9f0a") if stars == 4 else QColor("#ff3b30"))
+        sr   = 11.0 if narrow else 17.0
+        sgap = 9.0 if narrow else 14.0
+        sy = (div_y + (card_y + card_h)) / 2.0
+        if narrow:
+            row_w = 5 * (2 * sr + sgap) - sgap
+            sx0 = card_x + (card_w - row_w) / 2.0 + sr   # gecentreerd
+        else:
+            sx0 = card_x + 26 + sr
+        for k in range(5):
+            sxc = sx0 + k * (sr * 2 + sgap)
+            if k < stars:
+                glow = QColor(lit_col); glow.setAlpha(60)
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(glow)
+                p.drawPolygon(_star_polygon(sxc, sy, sr + 3, (sr + 3) * 0.45))
+                p.setBrush(lit_col)
+                p.drawPolygon(_star_polygon(sxc, sy, sr, sr * 0.45))
+            else:
+                p.setPen(QPen(QColor("#3a3f47"), 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPolygon(_star_polygon(sxc, sy, sr, sr * 0.45))
+        if not narrow:
+            if stars == 0:   st_txt, st_col = "Rustig", _qc("gray2")
+            elif stars <= 2: st_txt, st_col = "Activiteit", QColor("#ffd60a")
+            elif stars <= 4: st_txt, st_col = "Verhoogde activiteit", QColor("#ff9f0a")
+            else:            st_txt, st_col = "Zeer druk", QColor("#ff3b30")
+            tx = sx0 + 5 * (sr * 2 + sgap) + 6
+            p.setFont(_sys_font(11, bold=True)); p.setPen(st_col)
+            p.drawText(int(tx), int(sy - 12), int(card_x + card_w - tx - 10), 24,
+                       int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), st_txt)
+        p.end()
+
+
+# ── RadialMeterWidget ─────────────────────────────────────────────────────────
+class RadialMeterWidget(QWidget):
+    """Radiale boog-meter: toont het STERKSTE signaal als halve-cirkel gauge.
+    Zelfde update_data-interface als SignalBarsWidget zodat hij inwisselbaar is."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._slots          = [{"freq": None, "db": 0.0} for _ in range(3)]
+        self._threshold      = float(THRESHOLD_SOFT)
+        self._hard_threshold = float(THRESHOLD_SOFT) + 10.0
+        self._slot_floor     = float(SLOT_FLOOR)
+        self._trends         = [0, 0, 0]
+        self._known_freqs    = set()
+        self._disp_db        = 0.0
+        self._target_db      = 0.0
+        self._live_db        = 0.0
+        self._live_freq      = None
+        self._hold_db        = 0.0
+        self._hold_until     = 0.0
+        self._hang_time      = float(HANG_TIME)
+        self._wanted_stars   = 0
+        self.setMinimumSize(220, 200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._anim = QTimer(self)
+        self._anim.timeout.connect(self._anim_step)
+        self._anim.start(33)
+
+    def _anim_step(self):
+        if _ease_step(self):
+            self.update()
+
+    def update_data(self, slots, threshold, slot_floor=20.0, trends=None,
+                    hard_threshold=None, known_freqs=None, live_db=None,
+                    live_freq=None, hang_time=None, wanted_stars=0):
+        self._slots          = [dict(s) for s in slots]
+        self._threshold      = float(threshold)
+        self._slot_floor     = float(slot_floor)
+        self._hard_threshold = float(hard_threshold) if hard_threshold else float(threshold) + 10.0
+        self._trends         = trends or [0, 0, 0]
+        self._known_freqs    = known_freqs or set()
+        self._wanted_stars   = int(wanted_stars)
+        if hang_time is not None:
+            self._hang_time = float(hang_time)
+        _set_target(self, slots, live_db, live_freq)
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, _qc("panel"))
+
+        # Zwarte achtergrond (dashboard-stijl)
+        p.fillRect(0, 0, W, H, QColor("#000000"))
+
+        db     = self._disp_db
+        freq   = self._live_freq
+        active = freq is not None and db > self._slot_floor
+
+        # Lineaire schaal slot_floor..db_max over de 270° wijzerplaat
+        db_max = self._hard_threshold + 8.0
+        rng    = max(1.0, db_max - self._slot_floor)
+        f      = max(0.0, min(1.0, (db - self._slot_floor) / rng))
+
+        # Geometrie — 270° meter met opening onderaan
+        cx = W / 2.0
+        cy = H * 0.56                      # naaf laag → naald ruim onder de cijfers
+        R  = max(46.0, min(W * 0.46, H * 0.42))
+        A0, SWEEP = 225.0, 270.0          # 0 linksonder, met de klok mee
+
+        def ang(fr):
+            return A0 - SWEEP * fr
+
+        def pt(r, deg):
+            a = math.radians(deg)
+            return (cx + r * math.cos(a), cy - r * math.sin(a))
+
+        def block_col(val):
+            if val < self._threshold:      return QColor("#2ed158")   # groen
+            if val < self._hard_threshold: return QColor("#ff9f0a")   # oranje
+            return QColor("#ff3b30")                                  # rood
+
+        # 10 gekleurde vakjes (groen / oranje / rood) met glow
+        ring_w = max(11.0, R * 0.17)
+        r_ring = R - ring_w / 2.0
+        ring_rect = QRectF(cx - r_ring, cy - r_ring, 2 * r_ring, 2 * r_ring)
+        N, gap = 10, 2.6
+        for i in range(N):
+            a_lo = ang((i + 1) / N) + gap / 2.0
+            a_hi = ang(i / N) - gap / 2.0
+            col  = block_col(self._slot_floor + (i + 0.5) / N * rng)
+            glow = QColor(col); glow.setAlpha(55)
+            pen = QPen(glow, ring_w + 8); pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            p.setPen(pen)
+            p.drawArc(ring_rect, int(round(a_lo * 16)), int(round((a_hi - a_lo) * 16)))
+            pen = QPen(col, ring_w); pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            p.setPen(pen)
+            p.drawArc(ring_rect, int(round(a_lo * 16)), int(round((a_hi - a_lo) * 16)))
+
+        # Streepjes + dB-getallen binnen de ring
+        r_tick = R - ring_w - 3
+        n_major = 8
+        for j in range(n_major + 1):
+            fr  = j / n_major
+            deg = ang(fr)
+            x1, y1 = pt(r_tick, deg); x2, y2 = pt(r_tick - 13, deg)
+            p.setPen(QPen(QColor("#e0e0e0"), 2.2))
+            p.drawLine(int(x1), int(y1), int(x2), int(y2))
+            lx, ly = pt(r_tick - 27, deg)
+            p.setFont(_sys_font(8, bold=True))
+            p.setPen(QColor("#c8c8c8"))
+            p.drawText(int(lx - 16), int(ly - 9), 32, 18,
+                       int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                       f"{self._slot_floor + fr * rng:.0f}")
+            if j < n_major:
+                for k in range(1, 4):
+                    dm = ang(fr + (k / 4.0) / n_major)
+                    mx1, my1 = pt(r_tick, dm); mx2, my2 = pt(r_tick - 6, dm)
+                    p.setPen(QPen(QColor("#707070"), 1.0))
+                    p.drawLine(int(mx1), int(my1), int(mx2), int(my2))
+
+        # Digitale cijferweergave (LCD-look) hoog in de wijzerplaat
+        col_dig = block_col(db) if active else QColor("#5a3a12")
+        big = f"{db:.0f}" if active else "--"
+        num_rect = QRectF(cx - R * 0.7, cy - R * 0.80, R * 1.4, R * 0.44)
+        p.setFont(_sys_font(max(7, int(R * 0.34 * 0.4)), bold=True))
+        glow = QColor(col_dig); glow.setAlpha(70)
+        p.setPen(glow)
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            p.drawText(num_rect.translated(dx, dy),
+                       int(Qt.AlignmentFlag.AlignCenter), big)
+        p.setPen(col_dig)
+        p.drawText(num_rect, int(Qt.AlignmentFlag.AlignCenter), big)
+        # Eenheid in LCD-kadertje
+        ur = QRectF(cx - R * 0.20, cy - R * 0.34, R * 0.40, R * 0.14)
+        p.setPen(QPen(QColor("#3a3a3a"), 1)); p.setBrush(QColor("#0c0c0c"))
+        p.drawRoundedRect(ur, 3, 3)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setFont(_sys_font(max(4, int(R * 0.10 * 0.4)), bold=True))
+        p.setPen(QColor("#cfcfcf"))
+        p.drawText(ur, int(Qt.AlignmentFlag.AlignCenter), "dB")
+
+        # Naald (rood) — altijd getekend, valt vloeiend terug
+        deg = ang(f)
+        tip   = QPointF(*pt(R * 0.82, deg))
+        left  = QPointF(*pt(6, deg + 90))
+        right = QPointF(*pt(6, deg - 90))
+        tail  = QPointF(*pt(R * 0.16, deg + 180))
+        ncol  = QColor("#ff2a2a") if active else QColor("#8a8a8a")
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(ncol)
+        p.drawPolygon(QPolygonF([tip, right, tail, left]))
+
+        # Glanzende naaf
+        hub_r = max(10.0, R * 0.13)
+        hub = QRadialGradient(cx - hub_r * 0.3, cy - hub_r * 0.3, hub_r * 1.4)
+        hub.setColorAt(0.0, QColor("#f2f2f2"))
+        hub.setColorAt(0.55, QColor("#9a9a9a"))
+        hub.setColorAt(1.0, QColor("#4a4a4a"))
+        p.setBrush(QBrush(hub)); p.setPen(QPen(QColor("#2a2a2a"), 1))
+        p.drawEllipse(QPointF(cx, cy), hub_r, hub_r)
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#6b6b6b"))
+        p.drawEllipse(QPointF(cx, cy), hub_r * 0.4, hub_r * 0.4)
+
+        # Vast merklabel "TETRA" (cyaan) in de opening onderaan
+        p.setFont(_sys_font(max(5, int(R * 0.17 * 0.4)), bold=True))
+        p.setPen(QColor("#22d3ee"))
+        p.drawText(0, int(cy + R * 0.42), W, int(R * 0.28),
+                   int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter), "TETRA")
+        # Kanaal (frequentie) apart eronder
+        if active:
+            star = "★ " if freq in self._known_freqs else ""
+            ch, ccol = f"{star}{freq:.3f} MHz", QColor("#e6e6e6")
+        else:
+            ch, ccol = "— geen kanaal", QColor("#666666")
+        p.setFont(_sys_font(max(4, int(R * 0.11 * 0.4)), bold=True))
+        p.setPen(ccol)
+        p.drawText(0, int(cy + R * 0.70), W, int(R * 0.24),
+                   int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter), ch)
+        p.end()
+
+
+def _bars_icon(color):
+    """Klein balken-icoontje voor de wisselknop."""
+    pm = QPixmap(18, 18)
+    pm.fill(Qt.GlobalColor.transparent)
+    pp = QPainter(pm)
+    pp.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pp.setPen(Qt.PenStyle.NoPen)
+    pp.setBrush(QColor(color))
+    pp.drawRoundedRect(QRectF(2.0,  9.0, 3.5,  7.0), 1, 1)
+    pp.drawRoundedRect(QRectF(7.25, 5.0, 3.5, 11.0), 1, 1)
+    pp.drawRoundedRect(QRectF(12.5, 2.0, 3.5, 14.0), 1, 1)
+    pp.end()
+    return QIcon(pm)
+
+
+def _gauge_icon(color):
+    """Klein meter-icoontje (boog + naald) voor de wisselknop."""
+    pm = QPixmap(18, 18)
+    pm.fill(Qt.GlobalColor.transparent)
+    pp = QPainter(pm)
+    pp.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 2.0)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pp.setPen(pen)
+    pp.drawArc(QRectF(2.0, 4.0, 14.0, 14.0), 20 * 16, 140 * 16)
+    pp.drawLine(9, 13, 13, 7)
+    pp.end()
+    return QIcon(pm)
+
+
+def _hbars_icon(color):
+    """Klein horizontaal-balk-icoontje voor de wisselknop."""
+    pm = QPixmap(18, 18)
+    pm.fill(Qt.GlobalColor.transparent)
+    pp = QPainter(pm)
+    pp.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pp.setPen(Qt.PenStyle.NoPen)
+    pp.setBrush(QColor(color))
+    pp.drawRoundedRect(QRectF(2.0,  3.0,  7.0, 3.5), 1, 1)
+    pp.drawRoundedRect(QRectF(2.0,  7.25, 11.0, 3.5), 1, 1)
+    pp.drawRoundedRect(QRectF(2.0, 11.5, 14.0, 3.5), 1, 1)
+    pp.end()
+    return QIcon(pm)
+
+
+# ── SignalDisplay (wisselbaar: verticale balk / horizontale balk / meter) ─────
+class SignalDisplay(QWidget):
+    """Wisselbare signaalweergave: verticale balk, horizontale balk of radiale
+    meter. Eén knop cyclet er doorheen; de keuze wordt onthouden."""
+    def __init__(self, settings_key="signal_view", parent=None):
+        super().__init__(parent)
+        self._key   = settings_key
+        self.bars   = SignalBarsWidget()    # 0 = verticale balk
+        self.hbars  = SignalBarsHWidget()   # 1 = horizontale balk
+        self.meter  = RadialMeterWidget()   # 2 = radiale meter
+        self._stack = QStackedWidget(self)
+        self._stack.addWidget(self.bars)
+        self._stack.addWidget(self.hbars)
+        self._stack.addWidget(self.meter)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._stack)
+
+        # Iconen per weergave (de knop toont die van de VOLGENDE)
+        self._icons = [_bars_icon(C['gray1']), _hbars_icon(C['gray1']), _gauge_icon(C['gray1'])]
+        self._btn = QPushButton(self)
+        self._btn.setFixedSize(30, 24)
+        self._btn.setIconSize(QSize(16, 16))
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.setToolTip("Wissel weergave: balk / horizontaal / meter")
+        self._btn.setStyleSheet(
+            f"QPushButton {{ background:{C['panel2']};"
+            f" border:1px solid {C['sep']}; border-radius:5px; }}"
+            f" QPushButton:hover {{ border:1px solid {C['gray2']}; }}")
+        self._btn.clicked.connect(self.toggle)
+
+        try:
+            idx = int(QSettings("PrioSense", SETTINGS_APP).value(self._key, 0))
+        except (TypeError, ValueError):
+            idx = 0
+        self.set_view(idx)
+
+    def set_view(self, idx):
+        idx = idx % self._stack.count()
+        self._stack.setCurrentIndex(idx)
+        nxt = (idx + 1) % self._stack.count()
+        self._btn.setIcon(self._icons[nxt])   # icoon van de volgende weergave
+        QSettings("PrioSense", SETTINGS_APP).setValue(self._key, idx)
+
+    def toggle(self):
+        self.set_view(self._stack.currentIndex() + 1)
+
+    def resizeEvent(self, e):
+        self._btn.move(self.width() - self._btn.width() - 6, 5)
+        self._btn.raise_()
+        super().resizeEvent(e)
+
+    def update_data(self, *args, **kwargs):
+        self.bars.update_data(*args, **kwargs)
+        self.hbars.update_data(*args, **kwargs)
+        self.meter.update_data(*args, **kwargs)
 
 
 # ── AlarmCard ─────────────────────────────────────────────────────────────────
@@ -1017,6 +1658,8 @@ class LabeledSlider(QWidget):
         self.slider.setValue(round((init - lo) / step))
         self.slider.setStyleSheet(_slider_qss(color))
         self.slider.valueChanged.connect(self._emit)
+        # Scroll-wheel negeren → scrollt het paneel i.p.v. de slider te verzetten
+        self.slider.wheelEvent = lambda e: e.ignore()
         vbox.addWidget(self.slider)
 
     def _emit(self, step_val):
@@ -1409,9 +2052,10 @@ class CompactWindow(QMainWindow):
     def __init__(self, det, parent=None):
         super().__init__(parent)
         self.setWindowTitle("PrioSense")
-        self.setFixedSize(300, 370)
+        self.setMinimumSize(260, 300)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet(QSS)
+        self._cset = QSettings("PrioSense", SETTINGS_APP)
         cw = QWidget()
         self.setCentralWidget(cw)
         lay = QVBoxLayout(cw)
@@ -1420,13 +2064,31 @@ class CompactWindow(QMainWindow):
         self.alarm_card = AlarmCard()
         self.alarm_card.setMaximumHeight(80)
         lay.addWidget(self.alarm_card)
-        self.bars = SignalBarsWidget()
+        self.bars = SignalDisplay("signal_view_compact")
         lay.addWidget(self.bars, stretch=1)
         hint = QLabel("Druk  C  voor volledig scherm")
         hint.setFont(_sys_font(7))
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setStyleSheet(f"color: {C['gray3']};")
         lay.addWidget(hint)
+
+        # Verstelbaar venster: opgeslagen grootte herstellen, anders standaard
+        _g = self._cset.value("compact_geometry")
+        if _g is not None:
+            self.restoreGeometry(_g)
+        else:
+            self.resize(320, 400)
+
+    def _save_geo(self):
+        self._cset.setValue("compact_geometry", self.saveGeometry())
+
+    def hideEvent(self, event):
+        self._save_geo()
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        self._save_geo()
+        super().closeEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_C:
@@ -1644,6 +2306,16 @@ class MainWindow(QMainWindow):
         MODES[1]["hard_threshold"] = _load("custom_hard",  MODES[1]["hard_threshold"], lo=10,  hi=60)
         MODES[1]["hang_time"]      = _load("custom_hang",  MODES[1]["hang_time"],      lo=0.5, hi=10)
 
+        # Drempels ALTIJD uit de herstelde modus halen — anders kan een oude
+        # opgeslagen drempel niet overeenkomen met de getoonde modus (Stad/Snelweg
+        # zijn vast; Custom-waarden staan al in MODES[1]).
+        _m = MODES[saved_mode]
+        det.threshold      = _m["threshold"]
+        det.hard_threshold = _m["hard_threshold"]
+        det.slot_floor     = _m["slot_floor"]
+        det.hang_time      = _m["hang_time"]
+        det.mode_name      = _m["name"]
+
         self.setWindowTitle("PrioSense" + TITLE_SUFFIX)
         # In vergelijkingsmodus kleiner minimum zodat 2 vensters naast elkaar passen
         if TITLE_SUFFIX:
@@ -1691,8 +2363,8 @@ class MainWindow(QMainWindow):
         self.spec2, self.curve_pwr2, self.curve_base2 = self._make_spectrum(det)
         self.wfall_panel  = WaterfallPanelWidget(det)
         self.wfall_panel2 = WaterfallPanelWidget(det)
-        self.bars   = SignalBarsWidget()
-        self.bars2  = SignalBarsWidget()
+        self.bars   = SignalDisplay("signal_view_top")
+        self.bars2  = SignalDisplay("signal_view_bot")
         self.hist_panel  = DetectionHistoryWidget()
 
         # ── Linker kolom: 2 panel slots ───────────────────────────────────────
@@ -1808,11 +2480,6 @@ class MainWindow(QMainWindow):
         mc_l = QHBoxLayout(mode_ctrl); mc_l.setContentsMargins(0, 0, 0, 0); mc_l.setSpacing(6)
         mc_l.addWidget(self.btn_mode); mc_l.addWidget(self.btn_mode_info)
         grp_sens.add(SettingsRow("Rijmodus", mode_ctrl, "Stad · Custom · Snelweg"))
-
-        self.sl_thr = LabeledSlider("Drempel dB", 5, 50, det.threshold,
-            step=1.0, color=C['red'])
-        self.sl_thr.valueChanged.connect(lambda v: setattr(self.det, 'threshold', v))
-        grp_sens.add(_slider_row(self.sl_thr))
 
         custom = MODES[1]  # Custom is altijd index 1
         self.sl_custom_floor = LabeledSlider("Custom vloer dB",   0,  40, custom["slot_floor"],     step=1.0, color=C['gray2'])
@@ -1937,6 +2604,18 @@ class MainWindow(QMainWindow):
         set_scroll.setWidget(tab_set)
         self._tabs.addTab(set_scroll, "Instellingen")
 
+        # Smalle altijd-zichtbare knop links van de tabs (in-/uitklappen)
+        self.btn_sidebar = QPushButton("☰")
+        self.btn_sidebar.setFixedWidth(26)
+        self.btn_sidebar.setFont(_sys_font(13, bold=True))
+        self.btn_sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.btn_sidebar.setToolTip("Menu in-/uitklappen")
+        self.btn_sidebar.setStyleSheet(
+            f"QPushButton {{ background:{C['panel2']}; color:{C['gray2']};"
+            f" border:1px solid {C['sep']}; border-radius:5px; }}"
+            f" QPushButton:hover {{ color:{C['white']}; }}")
+        self.btn_sidebar.clicked.connect(self._toggle_sidebar)
+        content_hbox.addWidget(self.btn_sidebar)
         content_hbox.addWidget(self._tabs)
 
         # ── Onderste balk ─────────────────────────────────────────────────────
@@ -1986,6 +2665,9 @@ class MainWindow(QMainWindow):
             self._tabs.setCurrentIndex(int(self._settings.value("tab_idx", 0)))
         except Exception:
             pass
+        if self._settings.value("sidebar_vis", "true") == "false":
+            self._tabs.setVisible(False)
+            self.btn_sidebar.setText("≡")
         _geo = self._settings.value("geometry")
         if _geo is not None:
             try: self.restoreGeometry(_geo)
@@ -2107,8 +2789,6 @@ class MainWindow(QMainWindow):
         self.det.mode_name       = m["name"]
         self.det.auto_gain       = False
         self.det.set_gain(m["gain_db"], auto=False)
-        self.sl_thr.slider.setValue(
-            round((m["threshold"] - self.sl_thr._lo) / self.sl_thr._step))
         self.sl_gain.slider.setValue(
             round((m["gain_db"] - self.sl_gain._lo) / self.sl_gain._step))
         self.sw_auto.setChecked(False)
@@ -2232,6 +2912,11 @@ class MainWindow(QMainWindow):
             self._compact_win.activateWindow()
             self.hide()
 
+    def _toggle_sidebar(self):
+        vis = not self._tabs.isVisible()
+        self._tabs.setVisible(vis)
+        self.btn_sidebar.setText("☰" if vis else "≡")
+
     def _toggle_occupancy(self, checked):
         self.det.occupancy_check = bool(checked)
 
@@ -2299,9 +2984,13 @@ class MainWindow(QMainWindow):
                 trends.append(0)
 
         self.bars.update_data(slots_snap, self.det.threshold, self.det.slot_floor, trends,
-                              hard_threshold=self.det.hard_threshold)
+                              hard_threshold=self.det.hard_threshold,
+                              live_db=self.det.live_db, live_freq=self.det.live_freq,
+                              hang_time=self.det.hang_time, wanted_stars=self.det.wanted_stars)
         self.bars2.update_data(slots_snap, self.det.threshold, self.det.slot_floor, trends,
-                               hard_threshold=self.det.hard_threshold)
+                               hard_threshold=self.det.hard_threshold,
+                               live_db=self.det.live_db, live_freq=self.det.live_freq,
+                               hang_time=self.det.hang_time, wanted_stars=self.det.wanted_stars)
 
         # AGR actief → switch oranje kleuren als gain is verlaagd
         if hasattr(self, 'sw_agr'):
@@ -2312,7 +3001,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_bars_fs_win') and self._bars_fs_win and self._bars_fs_win.isVisible():
             self._bars_fs_win.bars.update_data(slots_snap, self.det.threshold,
                                                self.det.slot_floor, trends,
-                                               hard_threshold=self.det.hard_threshold)
+                                               hard_threshold=self.det.hard_threshold,
+                                               live_db=self.det.live_db,
+                                               live_freq=self.det.live_freq,
+                                               hang_time=self.det.hang_time,
+                                               wanted_stars=self.det.wanted_stars)
 
         if not alarm:
             self.alarm_card.set_idle(activity)
@@ -2344,7 +3037,9 @@ class MainWindow(QMainWindow):
         if self._compact_win.isVisible():
             self._compact_win.bars.update_data(
                 slots_snap, self.det.threshold, self.det.slot_floor, trends,
-                hard_threshold=self.det.hard_threshold)
+                hard_threshold=self.det.hard_threshold,
+                live_db=self.det.live_db, live_freq=self.det.live_freq,
+                hang_time=self.det.hang_time, wanted_stars=self.det.wanted_stars)
 
         # (Waterfall wordt in de snelle 100ms timer bijgewerkt)
 
@@ -2422,6 +3117,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("slot_top_idx",    self.slot_top._idx)
         self._settings.setValue("slot_bot_idx",    self.slot_bot._idx)
         self._settings.setValue("tab_idx",         self._tabs.currentIndex())
+        self._settings.setValue("sidebar_vis",      str(self._tabs.isVisible()).lower())
         self._settings.setValue("geometry",        self.saveGeometry())
         self._timer.stop()
         self.det.stop()
@@ -2464,7 +3160,7 @@ class BarFullscreenWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.Window)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 20)
-        self.bars = SignalBarsWidget()
+        self.bars = SignalDisplay("signal_view_fs")
         lay.addWidget(self.bars)
         hint = QLabel("Druk ESC om te sluiten")
         hint.setFont(_sys_font(8))
